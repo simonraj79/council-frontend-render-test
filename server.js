@@ -2,9 +2,11 @@
 //
 // One Render Node web service does two jobs on the SAME origin (zero CORS):
 //   1. Serves the built Vite React SPA from ./client/dist (static + SPA fallback).
-//   2. Exposes POST /api/council {prompt} which server-side calls the Vertex AI
-//      Reasoning Engine REST API (create_session -> stream_query), aggregates the
-//      streamed ADK events, and returns { text }.
+//   2. Exposes the council API which server-side calls the Vertex AI Reasoning
+//      Engine REST API (create_session -> stream_query):
+//        - POST /api/council         aggregates the stream, returns { text }.
+//        - POST /api/council/stream  RELAYS the stream live as SSE so the browser
+//          can progressively reveal each department + the final synthesis.
 //
 // The browser only ever talks to its own origin, so the short-lived Google OAuth
 // bearer token (GOOGLE_ACCESS_TOKEN) never leaves the server.
@@ -31,6 +33,22 @@ const UPSTREAM_TIMEOUT_MS = 200000; // 200s — survives Render free-tier + agen
 const HOST = `${REGION}-aiplatform.googleapis.com`;
 const NAME = `projects/${PROJECT}/locations/${REGION}/reasoningEngines/${ENGINE_ID}`;
 const BASE = `https://${HOST}/v1beta1/${NAME}`;
+
+// Verified against the live engine: the moderator's final synthesis is the event
+// whose node_info.output_for includes the ROOT engine "council_moderator@1"
+// (equivalently node_info.path === this rootPath). Specialist events have a
+// "/<specialist>@1" suffix on the path and do NOT list the root in output_for.
+const ROOT_PATH = 'council_moderator@1/main_orchestration_workflow@1';
+const ROOT_OUTPUT_FOR = 'council_moderator@1';
+
+// author key -> human display name for the 5 departments
+const DEPARTMENTS = {
+  software_engineer: 'Software Engineer',
+  product_manager: 'Product Manager',
+  ux_ui_designer: 'UX/UI Designer',
+  security_sre: 'Security & SRE',
+  technical_writer: 'Technical Writer',
+};
 
 function token() {
   const t = process.env.GOOGLE_ACCESS_TOKEN;
@@ -76,12 +94,13 @@ async function createSession(userId, signal) {
   return j?.output?.id || j?.output?.sessionId || null;
 }
 
-// ---- Step 2: stream_query (SSE) -> aggregate the final moderator text --------
+// ---- Shared stream helpers ---------------------------------------------------
 function isModeratorAuthor(author) {
   return /orchestrat|moderator|council|root/i.test(author || '');
 }
 
-async function runCouncil(userId, sessionId, message, signal) {
+// Open the upstream :streamQuery?alt=sse fetch. Returns the Response (caller reads body).
+async function openStreamQuery(userId, sessionId, message, signal) {
   const input = { user_id: userId, message };
   if (sessionId) input.session_id = sessionId;
 
@@ -103,63 +122,74 @@ async function runCouncil(userId, sessionId, message, signal) {
     err.status = 502;
     throw err;
   }
+  return res;
+}
 
-  // Collected texts, in stream order, with routing metadata.
-  const events = []; // { author, txt, isRoot }
-  let longest = ''; // fallback: longest single text seen
+// Parse one raw NDJSON/SSE line into a normalized { author, txt, isRoot } or null.
+function parseCouncilLine(jsonStr) {
+  let ev;
+  try {
+    ev = JSON.parse(jsonStr);
+  } catch {
+    return null;
+  }
+  // Some transports wrap the event; normalize a couple of shapes.
+  const node = ev?.content ? ev : ev?.output ? ev.output : ev;
+  const parts = node?.content?.parts;
+  if (!Array.isArray(parts)) return null;
+  const txt = parts.map((p) => (p && p.text ? p.text : '')).join('').trim();
+  if (!txt) return null;
+  const ni = node.node_info || ev.node_info || {};
+  const outFor = Array.isArray(ni.output_for) ? ni.output_for : [];
+  const isRoot = outFor.includes(ROOT_OUTPUT_FOR) || ni.path === ROOT_PATH;
+  return { author: node.author || ev.author || '', txt, isRoot };
+}
 
-  // Verified against the live engine: the moderator's final synthesis is the
-  // event whose node_info.output_for includes the ROOT engine "council_moderator@1"
-  // (equivalently node_info.path === this rootPath). Specialist events have a
-  // "/<specialist>@1" suffix on the path and do NOT list the root in output_for.
-  const rootPath = 'council_moderator@1/main_orchestration_workflow@1';
-
-  const handleEvent = (jsonStr) => {
-    let ev;
-    try {
-      ev = JSON.parse(jsonStr);
-    } catch {
-      return;
-    }
-    // Some transports wrap the event; normalize a couple of shapes.
-    const node = ev?.content ? ev : ev?.output ? ev.output : ev;
-    const parts = node?.content?.parts;
-    if (Array.isArray(parts)) {
-      const txt = parts.map((p) => (p && p.text ? p.text : '')).join('').trim();
-      if (txt) {
-        const ni = node.node_info || ev.node_info || {};
-        const outFor = Array.isArray(ni.output_for) ? ni.output_for : [];
-        const isRoot = outFor.includes('council_moderator@1') || ni.path === rootPath;
-        events.push({ author: node.author || ev.author || '', txt, isRoot });
-        if (txt.length > longest.length) longest = txt;
-      }
-    }
-  };
-
+// Read the upstream body, splitting NDJSON/SSE lines, invoking onLine(rawLine)
+// for each complete data line (already stripped of the optional "data:" prefix).
+async function readLines(res, onLine) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
+  const drain = (flush) => {
     let idx;
-    // SSE frames are newline-delimited; tolerate bare-JSON lines too.
     while ((idx = buf.indexOf('\n')) >= 0) {
       let line = buf.slice(0, idx).replace(/\r$/, '');
       buf = buf.slice(idx + 1);
       if (!line) continue;
       if (line.startsWith('data:')) line = line.slice(5).trim();
       if (!line || line === '[DONE]') continue;
-      if (line[0] === '{' || line[0] === '[') handleEvent(line);
+      if (line[0] === '{' || line[0] === '[') onLine(line);
     }
+    if (flush && buf.trim()) {
+      let l = buf.trim();
+      if (l.startsWith('data:')) l = l.slice(5).trim();
+      buf = '';
+      if (l && (l[0] === '{' || l[0] === '[')) onLine(l);
+    }
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    drain(false);
   }
-  // Flush any trailing partial frame.
-  if (buf.trim()) {
-    let l = buf.trim();
-    if (l.startsWith('data:')) l = l.slice(5).trim();
-    if (l && (l[0] === '{' || l[0] === '[')) handleEvent(l);
-  }
+  drain(true);
+}
+
+// ---- Non-stream: aggregate the final moderator text (unchanged behavior) -----
+async function runCouncil(userId, sessionId, message, signal) {
+  const res = await openStreamQuery(userId, sessionId, message, signal);
+
+  const events = []; // { author, txt, isRoot }
+  let longest = ''; // fallback: longest single text seen
+
+  await readLines(res, (line) => {
+    const ev = parseCouncilLine(line);
+    if (!ev) return;
+    events.push(ev);
+    if (ev.txt.length > longest.length) longest = ev.txt;
+  });
 
   // Prefer the LAST root synthesis event (node_info-based, verified); then the
   // author heuristic; then the last event; then the longest text ever seen.
@@ -217,6 +247,127 @@ app.post('/api/council', async (req, res) => {
     }
     const status = e.status && e.status >= 400 ? e.status : 500;
     return res.status(status).json({ error: String(e.message || e), upstream: e.upstream });
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+// ---- Streaming: RELAY the council stream to the browser as named SSE events --
+//
+// SSE contract (proxy -> browser):
+//   event: department  data: {"key","name","text"}   (accumulated per specialist)
+//   event: synthesis   data: {"text"}                (moderator synthesis, final)
+//   event: error       data: {"error","status"}
+//   event: done        data: {}
+app.post('/api/council/stream', async (req, res) => {
+  const message = ((req.body && req.body.prompt) || (req.body && req.body.message) || '').toString();
+
+  // SSE headers — flush immediately so the browser opens the stream.
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+  const sse = (event, obj) => {
+    res.write('event: ' + event + '\ndata: ' + JSON.stringify(obj) + '\n\n');
+  };
+
+  // Guard against writing after the socket is gone.
+  let closed = false;
+  const ctrl = new AbortController();
+  const finish = () => {
+    if (closed) return;
+    closed = true;
+    try {
+      sse('done', {});
+    } catch {}
+    try {
+      res.end();
+    } catch {}
+  };
+  const fail = (err, status) => {
+    if (closed) return;
+    const st = status || (err && err.status && err.status >= 400 ? err.status : 500);
+    try {
+      sse('error', { error: String((err && err.message) || err || 'stream error'), status: st });
+    } catch {}
+    finish();
+  };
+
+  if (!message.trim()) {
+    return fail(new Error('prompt required'), 400);
+  }
+  if (!PROJECT || !ENGINE_ID) {
+    return fail(new Error('server misconfigured: GCP_PROJECT / ENGINE_ID not set'), 500);
+  }
+
+  // Abort the upstream fetch if the browser disconnects. NOTE: use res 'close'
+  // (fires on real client disconnect / response end), NOT req 'close' — for a POST,
+  // req 'close' fires as soon as Express finishes reading the request body, which
+  // would abort the upstream before we ever stream a single event.
+  const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS);
+  res.on('close', () => {
+    closed = true;
+    ctrl.abort();
+    clearTimeout(timer);
+  });
+
+  const deptText = Object.create(null); // author key -> accumulated text
+  let rootText = ''; // accumulated moderator synthesis (last root wins)
+  let longest = ''; // fallback if no root event ever seen
+
+  try {
+    const userId = 'render-' + Date.now();
+    let sid = null;
+    try {
+      sid = await createSession(userId, ctrl.signal);
+    } catch (e) {
+      // A hard auth/permission failure will also fail stream_query — surface now.
+      if (e.status === 401 || e.status === 403) return fail(e);
+    }
+
+    const upstream = await openStreamQuery(userId, sid, message, ctrl.signal);
+
+    await readLines(upstream, (line) => {
+      if (closed) return;
+      const ev = parseCouncilLine(line);
+      if (!ev) return;
+      if (ev.txt.length > longest.length) longest = ev.txt;
+
+      if (ev.isRoot) {
+        // Accumulate the synthesis; keep the longest/last root text.
+        rootText = ev.txt.length >= rootText.length ? ev.txt : rootText + ev.txt;
+        // Optional interim reveal of the synthesis as it grows.
+        sse('synthesis', { text: rootText });
+        return;
+      }
+
+      const key = ev.author;
+      if (key && DEPARTMENTS[key]) {
+        // Accumulate in case a specialist emits multiple partial chunks.
+        deptText[key] = (deptText[key] || '') + ev.txt;
+        sse('department', { key, name: DEPARTMENTS[key], text: deptText[key] });
+      }
+      // Unknown / other authors: ignore.
+    });
+
+    if (closed) return; // client already gone
+
+    const finalText = rootText || longest;
+    if (!finalText && Object.keys(deptText).length === 0) {
+      return fail(new Error('no synthesized text returned by the agent'), 502);
+    }
+    sse('synthesis', { text: finalText });
+    finish();
+  } catch (e) {
+    if (closed) return;
+    if (e.name === 'AbortError') {
+      return fail(new Error(`upstream timed out after ${UPSTREAM_TIMEOUT_MS}ms (cold start)`), 504);
+    }
+    return fail(e);
   } finally {
     clearTimeout(timer);
   }
