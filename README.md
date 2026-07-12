@@ -1,49 +1,63 @@
-# council-moderator-render
+# council-moderator-render — cross-cloud access to the GCP Agent Platform
 
-A minimal **cross-platform access proof**: a React front-end and a Node/Express
-proxy, deployed as **one Render free web service**, that reaches the
-`council_moderator` **Vertex AI Agent Engine** hosted on Google Cloud.
+A **cross-cloud access proof**: a React front-end + Node/Express proxy, deployed as
+**one Render free web service**, that reaches the `council_moderator` **Vertex AI
+Agent Engine** on Google Cloud and **streams** the five departments' answers live.
 
-It demonstrates that an Agent Engine deployed on Google Cloud can be driven from
-a front-end hosted on a completely different platform (Render.com).
+> **Render stands in for Azure.** The point is that a front-end hosted on a
+> *different* cloud — e.g. **Azure App Service** / **Azure Container Apps** — can
+> drive a GCP-hosted Agent Engine. Render is just a fast free stand-in; the
+> architecture, auth model, and code are identical for Azure.
+>
+> **Full write-up with diagrams (Mermaid, renders in Markdown):
+> [ARCHITECTURE.md](ARCHITECTURE.md).**
 
 ## What it proves
 
-- The browser (served from `https://<name>.onrender.com`) calls only its **own
-  origin** at `POST /api/council` — so there is **no CORS** anywhere.
+- The browser (served from the Render/Azure origin) calls only its **own origin**
+  at `POST /api/council/stream` — so there is **no CORS** anywhere.
 - The Express server holds a short-lived Google OAuth bearer token and makes the
   server-to-server REST calls to the Agent Engine on
   `us-central1-aiplatform.googleapis.com`. The token never reaches the browser.
-- The proxy performs the verified two-call ADK pattern: `create_session`, then
-  `stream_query` (SSE), aggregating the streamed events into the final
-  synthesized moderator readout.
+- The proxy **relays the agent's stream** as Server-Sent Events: each of the 5
+  departments arrives as its own `department` event (the UI fills a card live),
+  then the moderator's `synthesis`. A non-streaming `POST /api/council` returning
+  `{ text }` is kept as a fallback.
 
 ## Architecture
 
 ```
-Browser (Render origin)
-   |  POST /api/council { prompt }        (same origin, no CORS)
+Browser (Render/Azure origin)
+   |  POST /api/council/stream { prompt }     (same origin, no CORS)
    v
-Express server.js  ── Bearer GOOGLE_ACCESS_TOKEN ──▶  Vertex AI Agent Engine
-   |  serves client/dist (React SPA)                 (create_session, stream_query)
+Express server.js  ── Bearer GOOGLE_ACCESS_TOKEN ──▶  Vertex AI Agent Engine (GCP)
+   |  serves client/dist (React SPA)                 (create_session, streamQuery)
+   |                                            5 specialists in-process → Chair
+   ^  SSE relay: department x5 → synthesis  ◀──────────  author-tagged event stream
    v
-React app
+React app  (5 department cards fill live, then the synthesis)
 ```
 
 One service, two jobs on the same origin:
 1. `express.static('client/dist')` + SPA fallback serves the built React app.
-2. `POST /api/council` proxies to the reasoning engine and returns `{ text }`.
+2. `POST /api/council/stream` proxies to the reasoning engine and **relays** its
+   event stream to the browser as SSE (`department` per specialist, then `synthesis`).
+
+See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full component + sequence diagrams
+and the **Render → Azure** mapping.
 
 ## Layout
 
 ```
 frontend_test_render/
-  server.js         Express: static SPA + /api/council proxy + /api/health
+  server.js         Express: static SPA + /api/council/stream (SSE) + /api/council + /api/health
   package.json      root: express, build (builds client), start (node server.js)
+  ARCHITECTURE.md   diagrams + Render→Azure mapping
+  README.md
   .gitignore
   .env.example
-  README.md
-  client/           Vite React SPA (built to client/dist)
+  client/           Vite React SPA (progressive department cards → synthesis; built to client/dist)
+  e2e/              Playwright test (cold-start-robust mount + streaming assertions)
 ```
 
 ## Environment variables (server-side)
@@ -75,9 +89,23 @@ Smoke-check the proxy directly:
 
 ```bash
 curl http://localhost:8080/api/health
+
+# Streaming (watch department events arrive, then synthesis):
+curl -N -X POST http://localhost:8080/api/council/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Give a cross-functional readout for a student expense-splitting app."}'
+
+# Non-stream fallback (returns { text }):
 curl -X POST http://localhost:8080/api/council \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"Give a cross-functional readout for a student expense-splitting app."}'
+```
+
+Run the end-to-end Playwright streaming test against a deployed URL:
+
+```bash
+cd e2e && npm install && npx playwright install chromium
+RENDER_URL="https://<name>.onrender.com" npx playwright test
 ```
 
 ## Deploy on Render (free web service)
@@ -92,10 +120,11 @@ curl -X POST http://localhost:8080/api/council \
 ### Cold starts & timeouts
 
 Render free services sleep after ~15 min idle; the first request after idle
-takes ~30–60s to wake, and the agent itself can cold-start ~20–60s. The proxy
-uses a **120s** upstream timeout, and any Playwright / browser test should wait
-with an equally generous timeout. A warm-up `GET /api/health` before the real
-request helps.
+takes ~30–60s to wake (the SPA bundle request can even abort mid-wake), and the
+agent itself can cold-start ~20–60s. The proxy uses a **200s** upstream timeout;
+the Playwright test **retries the SPA mount** to survive cold-start bundle aborts.
+A warm-up `GET /api/health` before the real request helps. On **Azure App Service**,
+enabling **Always On** (paid tier) removes cold starts entirely.
 
 ## Security note (read this)
 
