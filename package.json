@@ -1,0 +1,18 @@
+{
+  "name": "council-moderator-render",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cross-platform access proof: Render-hosted React + Express proxy reaching a Vertex AI Agent Engine (council_moderator).",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm --prefix client install --include=dev && npm --prefix client run build",
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

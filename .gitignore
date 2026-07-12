@@ -1,0 +1,12 @@
+node_modules/
+client/node_modules/
+client/dist/
+dist/
+.env
+.env.local
+*.log
+.DS_Store
+e2e/node_modules/
+e2e/test-output/
+e2e/test-results/
+e2e/playwright-report/

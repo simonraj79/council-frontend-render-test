@@ -1,0 +1,13 @@
+{
+  "name": "council-frontend-render-test-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright cross-platform access test for the Render-hosted council_moderator front-end",
+  "scripts": {
+    "test": "playwright test",
+    "test:install": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1"
+  }
+}
