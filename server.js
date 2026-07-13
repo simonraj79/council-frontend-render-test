@@ -8,11 +8,23 @@
 //        - POST /api/council/stream  RELAYS the stream live as SSE so the browser
 //          can progressively reveal each department + the final synthesis.
 //
-// The browser only ever talks to its own origin, so the short-lived Google OAuth
-// bearer token (GOOGLE_ACCESS_TOKEN) never leaves the server.
+// The browser only ever talks to its own origin, so the Google OAuth bearer
+// token never leaves the server.
 //
-// Env vars read at runtime:
-//   GOOGLE_ACCESS_TOKEN  short-lived ADC token: `gcloud auth application-default print-access-token`
+// Credential env vars (resolved ONCE at startup, in PRIORITY order — the first
+// three AUTO-REFRESH via google-auth-library so the POC survives past ~1h):
+//   GOOGLE_ADC_JSON      RECOMMENDED — full JSON of the user's authorized_user
+//                        application_default_credentials.json (client_id/secret +
+//                        refresh_token). No admin, no service account.
+//   GOOGLE_SA_KEY_JSON   service-account key JSON (type service_account), if an
+//                        admin ever provides one.
+//   GOOGLE_APPLICATION_CREDENTIALS  key-file path OR run on GCP metadata (Cloud
+//                        Run/GCE) — ambient ADC, keyless.
+//   GOOGLE_ACCESS_TOKEN  LEGACY static ~1h token from
+//                        `gcloud auth application-default print-access-token`
+//                        (no refresh — last-resort fallback only).
+//
+// Other env vars read at runtime:
 //   GCP_PROJECT          e.g. ve-grp-1-333-project3-9rqd   (also accepts PROJECT)
 //   GCP_REGION           e.g. us-central1                  (also accepts REGION)
 //   ENGINE_ID            e.g. 8893446530510356480
@@ -21,6 +33,7 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { GoogleAuth, UserRefreshClient } from 'google-auth-library';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -50,26 +63,136 @@ const DEPARTMENTS = {
   technical_writer: 'Technical Writer',
 };
 
-function token() {
-  const t = process.env.GOOGLE_ACCESS_TOKEN;
-  if (!t) {
-    const err = new Error('GOOGLE_ACCESS_TOKEN is not set on the server');
+// ---- Auth: auto-refreshing Google credential (resolved ONCE, lazily) --------
+//
+// Priority: GOOGLE_ADC_JSON (authorized_user) > GOOGLE_SA_KEY_JSON (service_account)
+// > ambient ADC (GOOGLE_APPLICATION_CREDENTIALS key file / GCP metadata server)
+// > GOOGLE_ACCESS_TOKEN (legacy static ~1h token). The first three auto-refresh
+// via google-auth-library; the legacy token is returned as-is and still expires.
+const CLOUD_PLATFORM_SCOPE = 'https://www.googleapis.com/auth/cloud-platform';
+
+// Heuristic: are we running on a GCP runtime whose metadata server can mint
+// tokens for the attached service account? (Cloud Run / Functions / App Engine.)
+function onGcpMetadata() {
+  return Boolean(
+    process.env.K_SERVICE ||       // Cloud Run / Cloud Functions (2nd gen)
+    process.env.FUNCTION_TARGET || // Cloud Functions
+    process.env.GAE_ENV ||         // App Engine
+    process.env.GCE_METADATA_HOST  // explicit metadata host override
+  );
+}
+
+// Which credential source is active (or null if none). Never leaks secret values.
+function detectAuthMode() {
+  if (process.env.GOOGLE_ADC_JSON) return 'adc-user';
+  if (process.env.GOOGLE_SA_KEY_JSON) return 'sa-key';
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS || onGcpMetadata()) return 'metadata-adc';
+  if (process.env.GOOGLE_ACCESS_TOKEN) return 'static-token';
+  return null;
+}
+
+const AUTH_MODE = detectAuthMode();
+// Everything except the legacy static token can be force-refreshed on a 401.
+const AUTH_REFRESHABLE = AUTH_MODE !== null && AUTH_MODE !== 'static-token';
+
+let _authClient = null; // cached AuthClient (built once, lazily)
+
+// Build the underlying google-auth-library client for the active mode, once.
+async function getAuthClient() {
+  if (_authClient) return _authClient;
+  switch (AUTH_MODE) {
+    case 'adc-user': {
+      const c = JSON.parse(process.env.GOOGLE_ADC_JSON);
+      _authClient = new UserRefreshClient({
+        clientId: c.client_id,
+        clientSecret: c.client_secret,
+        refreshToken: c.refresh_token,
+      });
+      return _authClient;
+    }
+    case 'sa-key': {
+      const credentials = JSON.parse(process.env.GOOGLE_SA_KEY_JSON);
+      const auth = new GoogleAuth({ credentials, scopes: [CLOUD_PLATFORM_SCOPE] });
+      _authClient = await auth.getClient();
+      return _authClient;
+    }
+    case 'metadata-adc': {
+      // No explicit credentials: ADC resolves GOOGLE_APPLICATION_CREDENTIALS or
+      // the Cloud Run / GCE metadata server. Keyless deploys work with no code change.
+      const auth = new GoogleAuth({ scopes: [CLOUD_PLATFORM_SCOPE] });
+      _authClient = await auth.getClient();
+      return _authClient;
+    }
+    default:
+      // 'static-token' / null: no library client to build.
+      return null;
+  }
+}
+
+// Return a FRESH access token string every call. The library caches and
+// auto-refreshes for adc-user/sa-key/metadata-adc.
+async function getAccessToken() {
+  if (!AUTH_MODE) {
+    const err = new Error(
+      'No Google credential configured. Set one of (priority order): ' +
+      'GOOGLE_ADC_JSON (authorized_user JSON, recommended), ' +
+      'GOOGLE_SA_KEY_JSON (service_account key JSON), ' +
+      'GOOGLE_APPLICATION_CREDENTIALS (key-file path) / GCP metadata, or ' +
+      'GOOGLE_ACCESS_TOKEN (legacy static ~1h token).'
+    );
     err.status = 500;
     throw err;
   }
-  return t;
+  if (AUTH_MODE === 'static-token') return process.env.GOOGLE_ACCESS_TOKEN;
+
+  const client = await getAuthClient();
+  const { token } = await client.getAccessToken(); // object { token, ... } — destructure
+  if (!token) {
+    const err = new Error('failed to obtain a Google access token from the configured credential');
+    err.status = 500;
+    throw err;
+  }
+  return token;
 }
 
-function authHeaders() {
+// Force a fresh token (used by the 401 self-heal). Version-stable approach:
+// drop the cached token, then re-mint. No-op for the legacy static token.
+async function forceRefreshToken() {
+  if (!AUTH_REFRESHABLE) return;
+  const client = await getAuthClient();
+  if (client && client.credentials) client.credentials.access_token = null;
+  await getAccessToken();
+}
+
+async function authHeaders() {
   return {
-    Authorization: `Bearer ${token()}`,
+    Authorization: `Bearer ${await getAccessToken()}`,
     'Content-Type': 'application/json',
+    // Routes quota/billing for USER credentials (harmless for SA / metadata).
+    'x-goog-user-project': PROJECT,
   };
+}
+
+// Authenticated POST with a single 401 self-heal retry. On an upstream 401 AND a
+// refreshable credential, force a token refresh and retry ONCE. Returns the raw
+// Response WITHOUT consuming its body on the success path (so streaming responses
+// stay intact). Preserves the AbortController signal on the retry.
+async function authedPost(url, bodyObj, signal) {
+  const body = JSON.stringify(bodyObj);
+  let res = await fetch(url, { method: 'POST', headers: await authHeaders(), body, signal });
+  if (res.status === 401 && AUTH_REFRESHABLE) {
+    // Drain the failed body to free the socket, then refresh + retry once.
+    await res.text().catch(() => {});
+    await forceRefreshToken();
+    res = await fetch(url, { method: 'POST', headers: await authHeaders(), body, signal });
+  }
+  return res;
 }
 
 // Map an upstream Vertex status to a friendly hint.
 function upstreamHint(status) {
-  if (status === 401) return 'GOOGLE_ACCESS_TOKEN expired or invalid (re-mint and update the Render env var)';
+  if (status === 401)
+    return '401: credential invalid/expired. With GOOGLE_ADC_JSON the proxy auto-refreshes, so a persistent 401 means the credential was revoked or the identity lacks roles/aiplatform.user — refresh GOOGLE_ADC_JSON via `gcloud auth application-default login`.';
   if (status === 403) return 'permission denied for this identity on the reasoning engine';
   if (status === 404) return 'reasoning engine / method not found (check PROJECT / REGION / ENGINE_ID)';
   return 'upstream error';
@@ -77,12 +200,11 @@ function upstreamHint(status) {
 
 // ---- Step 1: create_session -> returns session id at output.id ---------------
 async function createSession(userId, signal) {
-  const res = await fetch(`${BASE}:query`, {
-    method: 'POST',
-    headers: authHeaders(),
-    body: JSON.stringify({ class_method: 'create_session', input: { user_id: userId } }),
+  const res = await authedPost(
+    `${BASE}:query`,
+    { class_method: 'create_session', input: { user_id: userId } },
     signal,
-  });
+  );
   if (!res.ok) {
     const body = (await res.text().catch(() => '')).slice(0, 800);
     const err = new Error(`create_session ${res.status}: ${upstreamHint(res.status)}`);
@@ -104,12 +226,11 @@ async function openStreamQuery(userId, sessionId, message, signal) {
   const input = { user_id: userId, message };
   if (sessionId) input.session_id = sessionId;
 
-  const res = await fetch(`${BASE}:streamQuery?alt=sse`, {
-    method: 'POST',
-    headers: authHeaders(),
-    body: JSON.stringify({ class_method: 'stream_query', input }),
+  const res = await authedPost(
+    `${BASE}:streamQuery?alt=sse`,
+    { class_method: 'stream_query', input },
     signal,
-  });
+  );
   if (!res.ok) {
     const body = (await res.text().catch(() => '')).slice(0, 800);
     const err = new Error(`stream_query ${res.status}: ${upstreamHint(res.status)}`);
@@ -208,7 +329,9 @@ app.use(express.json({ limit: '256kb' }));
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    configured: Boolean(PROJECT && ENGINE_ID && process.env.GOOGLE_ACCESS_TOKEN),
+    // True if ANY accepted credential source is present (not only the legacy token).
+    configured: Boolean(PROJECT && ENGINE_ID && AUTH_MODE),
+    authMode: AUTH_MODE, // adc-user | sa-key | metadata-adc | static-token | null
     project: PROJECT || null,
     region: REGION,
     engineId: ENGINE_ID || null,
@@ -384,7 +507,14 @@ app.get('*', (_req, res) => {
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`council-moderator proxy listening on 0.0.0.0:${PORT}`);
-  if (!process.env.GOOGLE_ACCESS_TOKEN) console.warn('WARN: GOOGLE_ACCESS_TOKEN not set — /api/council will fail');
+  if (!AUTH_MODE) {
+    console.warn(
+      'WARN: no Google credential configured — set GOOGLE_ADC_JSON (recommended), ' +
+      'GOOGLE_SA_KEY_JSON, GOOGLE_APPLICATION_CREDENTIALS, or GOOGLE_ACCESS_TOKEN; /api/council will fail'
+    );
+  } else {
+    console.log(`auth mode: ${AUTH_MODE}`);
+  }
   if (!PROJECT) console.warn('WARN: GCP_PROJECT/PROJECT not set');
   if (!ENGINE_ID) console.warn('WARN: ENGINE_ID not set');
 });
