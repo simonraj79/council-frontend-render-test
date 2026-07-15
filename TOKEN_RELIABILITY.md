@@ -43,7 +43,7 @@ auto-refresh):
 
 | Env var | Type | Auto-refresh |
 | --- | --- | --- |
-| `GOOGLE_ADC_JSON` | user ADC (`authorized_user`) — **recommended** | Yes |
+| `GOOGLE_ADC_JSON` | **any** Google credential JSON — for this POC, your user ADC (`authorized_user`) — **recommended** | Yes |
 | `GOOGLE_SA_KEY_JSON` | service-account key JSON | Yes |
 | `GOOGLE_APPLICATION_CREDENTIALS` / GCP metadata | ambient ADC (keyless on Cloud Run/GCE) | Yes |
 | `GOOGLE_ACCESS_TOKEN` | legacy static ~1h token | **No** (the old bug) |
@@ -125,8 +125,9 @@ just this one engine. Treat it accordingly:
 
 ## 6. Decision matrix
 
-**Recommendation: adopt Option 1 (`GOOGLE_ADC_JSON`, user refresh token,
-auto-refresh) for the immediate faculty POC.** It is the only reliable option
+**Recommendation: adopt Option 1 (`GOOGLE_ADC_JSON` holding your user refresh
+token — the health endpoint reports it as `authMode: "authorized_user"`,
+auto-refreshing) for the immediate faculty POC.** It is the only reliable option
 that fits the current IAM envelope with **zero admin action**, it permanently
 kills the ~1h outage (the library silently re-mints the token before each call),
 and it keeps the proxy + SPA exactly where they are — a config change, not a
@@ -137,7 +138,7 @@ re-architecture.
 | **1. `GOOGLE_ADC_JSON` — user refresh token, auto-refresh** *(RECOMMENDED)* | High — auto-refreshes each ~1h; valid until revoked / ~6-month inactivity / credential reset. No manual re-mint. | **No** — uses your own `roles/aiplatform.user`. | **Yes** — proxy unchanged. | **Minimal** — `gcloud auth application-default login` once, paste JSON as one secret env var, redeploy. | Broad **personal** credential in a 3rd-party secret store; dies on revoke / org reauth policy. |
 | **2. Service-account key JSON (`GOOGLE_SA_KEY_JSON`)** | High — SA key auto-refreshes, tied to a scoped SA not a person; survives faculty departure. | **Yes** — admin creates SA + key + grants `roles/aiplatform.user`. | **Yes** — proxy unchanged. | Low code (already supported), gated on admin. | Admin dependency; long-lived downloadable key is an exfiltration/secret-sprawl liability. |
 | **3. Cloud Run keyless proxy (metadata / ambient ADC)** | Highest — no stored secret; tokens minted + refreshed by the metadata server. | **Yes** — admin grants `reasoningEngines.query` to the Cloud Run runtime SA. | Front-end yes; **proxy moves to GCP** (Cloud Run). | Medium — new Cloud Run deploy + IAM grant + re-point SPA; **zero code change**. | Requires admin + new GCP infra; relocates the token-minting proxy off your hosting. |
-| **0. Raw `GOOGLE_ACCESS_TOKEN` (current bug)** | Low — hard ~1h expiry, no refresh. | No | Yes | None (status quo). | Guaranteed hourly 401 outage; unusable unattended. |
+| **0. Raw `GOOGLE_ACCESS_TOKEN` (legacy — health reports `degraded: true`)** | Low — hard ~1h expiry, no refresh. | No | Yes | None (status quo). | Guaranteed hourly 401 outage; unusable unattended. |
 
 ## 7. Upgrading later is CONFIG, not code
 
@@ -155,8 +156,11 @@ change, not a code change**:
 
 ## 8. Verify it survives past 1 hour
 
-**A. Health check** — `configured` must be `true` and `authMode` should be
-`adc-user` (values: `adc-user | sa-key | metadata-adc | static-token | null`):
+**A. Health check** — `configured` must be `true`, `authRefreshable` `true`,
+`degraded` `false`, and `authMode` should be `authorized_user` (`authMode` is the
+credential **type**: `authorized_user | service_account | external_account |
+external_account_authorized_user | impersonated_service_account | metadata-adc |
+static-token | null`):
 
 - **Windows PowerShell (primary):**
 
@@ -170,7 +174,18 @@ change, not a code change**:
   curl -s https://<your-service>.onrender.com/api/health
   ```
 
-  Expect: `{ ok: true, configured: true, authMode: "adc-user", project: "ve-grp-1-333-project3-9rqd", region: "us-central1", engineId: "8893446530510356480" }`.
+  Expect: `{ ok: true, configured: true, authRefreshable: true, degraded: false, authMode: "authorized_user", project: "ve-grp-1-333-project3-9rqd", region: "us-central1", engineId: "8893446530510356480" }`.
+
+  Notes:
+
+  - `authMode`/`project`/`region`/`engineId` appear only when no `COUNCIL_API_KEY`
+    is configured, or when you send the right `x-council-key` header.
+  - Add `?deep=1` for a live credential probe: `tokenOk: true` proves a token was
+    actually minted (cached ~60 s — safe to point an uptime monitor at).
+  - A **mangled `GOOGLE_ADC_JSON` paste fails closed**: health reports
+    `misconfigured: true` (with `ok: false`, `degraded: true`) and the parse error
+    is never echoed to clients — re-paste the full file contents as a single line,
+    from `{` to `}`.
 
 **B. One prompt** — should return synthesized `text`:
 

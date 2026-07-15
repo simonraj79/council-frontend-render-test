@@ -16,8 +16,9 @@ Agent Engine** on Google Cloud and **streams** the five departments' answers liv
 
 - The browser (served from the Render/Azure origin) calls only its **own origin**
   at `POST /api/council/stream` — so there is **no CORS** anywhere.
-- The Express server holds a short-lived Google OAuth bearer token and makes the
-  server-to-server REST calls to the Agent Engine on
+- The Express server holds an auto-refreshing Google credential (it mints the
+  short-lived OAuth bearer tokens itself) and makes the server-to-server REST
+  calls to the Agent Engine on
   `us-central1-aiplatform.googleapis.com`. The token never reaches the browser.
 - The proxy **relays the agent's stream** as Server-Sent Events: each of the 5
   departments arrives as its own `department` event (the UI fills a card live),
@@ -30,7 +31,7 @@ Agent Engine** on Google Cloud and **streams** the five departments' answers liv
 Browser (Render/Azure origin)
    |  POST /api/council/stream { prompt }     (same origin, no CORS)
    v
-Express server.js  ── Bearer GOOGLE_ACCESS_TOKEN ──▶  Vertex AI Agent Engine (GCP)
+Express server.js  ── Bearer (auto-refreshed cred) ──▶  Vertex AI Agent Engine (GCP)
    |  serves client/dist (React SPA)                 (create_session, streamQuery)
    |                                            5 specialists in-process → Chair
    ^  SSE relay: department x5 → synthesis  ◀──────────  author-tagged event stream
@@ -62,28 +63,64 @@ frontend_test_render/
 
 ## Environment variables (server-side)
 
+**Credential (set exactly ONE — resolved in this priority order at startup):**
+
 | Var | Purpose |
 | --- | --- |
-| `GOOGLE_ACCESS_TOKEN` | Short-lived ADC token (~1h) — `Authorization: Bearer` for Vertex. |
+| `GOOGLE_ADC_JSON` | **Recommended.** Full JSON of *any* Google credential file (`authorized_user`, `service_account`, `external_account`, …) — auto-refreshed via `google-auth-library`, so it survives past 1 hour with zero re-minting. |
+| `GOOGLE_SA_KEY_JSON` | Service-account key JSON — same auto-refresh handling; kept separate so an admin-issued SA key can coexist untouched. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to a key file, or run on GCP metadata (Cloud Run/GCE) for keyless ambient ADC. |
+| `GOOGLE_ACCESS_TOKEN` | **Legacy.** Static ~1h token, no refresh — last resort; `/api/health` reports `degraded: true` in this mode. |
+
+**Engine coordinates + hardening:**
+
+| Var | Purpose |
+| --- | --- |
 | `GCP_PROJECT` | `ve-grp-1-333-project3-9rqd` (also accepts `PROJECT`). |
 | `GCP_REGION` | `us-central1` (also accepts `REGION`). |
 | `ENGINE_ID` | `8893446530510356480`. |
+| `COUNCIL_API_KEY` | Optional. If set, `/api/council*` require the `x-council-key` header (and `/api/health` hides coordinates from callers without it). |
+| `RATE_LIMIT_PER_MIN` | Optional. Per-IP requests/min on council routes (default `10`, `0` = off). |
+| `MAX_INFLIGHT` | Optional. Global concurrent council runs (default `3`; excess gets `429`). |
+| `MAX_PROMPT_CHARS` | Optional. Prompt length cap (default `4000`; over gets `413`). |
 | `PORT` | Injected by Render; defaults to `8080` locally. |
 
 See `.env.example`. **No secret is ever committed** — `.env` is gitignored.
 
+**Multi-turn:** each response (and the SSE `session` event) carries `{ userId, sessionId }`;
+send both back on the next `POST` and the engine resumes the same conversation.
+
 ## Run locally
 
-```bash
-cp .env.example .env
-# paste a fresh token into .env:
-#   gcloud auth application-default print-access-token
+- **Windows PowerShell (primary):**
 
-npm install          # installs express
-npm run build        # installs + builds the React client into client/dist
-# load .env into the shell, then:
-npm start            # http://localhost:8080
-```
+  ```powershell
+  Copy-Item .env.example .env
+  # one-time login, then paste your ADC JSON (one line, { to }) into .env as GOOGLE_ADC_JSON:
+  gcloud auth application-default login
+  Get-Content "$env:APPDATA\gcloud\application_default_credentials.json" -Raw
+
+  npm install          # installs express + google-auth-library
+  npm run build        # installs + builds the React client into client/dist
+  # load .env into the shell, then:
+  npm start            # http://localhost:8080
+  ```
+
+- **macOS / Linux:**
+
+  ```bash
+  cp .env.example .env
+  # one-time login, then paste your ADC JSON (one line, { to }) into .env as GOOGLE_ADC_JSON:
+  gcloud auth application-default login
+  cat ~/.config/gcloud/application_default_credentials.json
+
+  npm install          # installs express + google-auth-library
+  npm run build        # installs + builds the React client into client/dist
+  # load .env into the shell, then:
+  npm start            # http://localhost:8080
+  ```
+
+(The credential setup walkthrough lives in [TOKEN_RELIABILITY.md](TOKEN_RELIABILITY.md).)
 
 Smoke-check the proxy directly:
 
@@ -114,7 +151,11 @@ RENDER_URL="https://<name>.onrender.com" npx playwright test
 - **Plan:** free
 - **Build command:** `npm install && npm run build`
 - **Start command:** `npm start`
-- **Env vars:** `GOOGLE_ACCESS_TOKEN` (secret), `GCP_PROJECT`, `GCP_REGION`, `ENGINE_ID`
+- **Env vars:** `GOOGLE_ADC_JSON` (secret, recommended — see
+  [TOKEN_RELIABILITY.md](TOKEN_RELIABILITY.md)), `GCP_PROJECT`, `GCP_REGION`,
+  `ENGINE_ID`; optionally `COUNCIL_API_KEY` (secret) and the other hardening vars above.
+  An existing deploy still on `GOOGLE_ACCESS_TOKEN` should switch its env var to
+  `GOOGLE_ADC_JSON` — no code change.
 - The server binds `0.0.0.0:$PORT` (Render injects `PORT`).
 
 ### Cold starts & timeouts
@@ -128,13 +169,18 @@ enabling **Always On** (paid tier) removes cold starts entirely.
 
 ## Security note (read this)
 
-`GOOGLE_ACCESS_TOKEN` is a **short-lived (~1h) personal ADC token** deliberately
-used only to prove cross-platform reachability. It is a real Google OAuth bearer
-token living on a third-party host, so:
+The proxy holds a **real Google credential on a third-party host**, so treat the
+env var as a secret (secret-typed env var / Key Vault reference; never log it).
 
-- The deploy + test must run inside the token's ~1h lifetime.
-- On a `401` from the agent, **re-mint** the token and update the Render env var
-  (`PUT /v1/services/{id}/env-vars/GOOGLE_ACCESS_TOKEN`), then redeploy.
-- **This is not production.** A durable deployment needs an admin-provisioned
-  service account with `roles/aiplatform.user` whose short-lived tokens are
-  minted server-side — not a personal ADC token.
+- **Credential setup, reliability, and rotation are covered in
+  [TOKEN_RELIABILITY.md](TOKEN_RELIABILITY.md)** — including why `GOOGLE_ADC_JSON`
+  auto-refreshes past the old ~1h outage, what a persistent `401` means now
+  (revoked credential or lost IAM role, not expiry), and how to revoke.
+- The legacy `GOOGLE_ACCESS_TOKEN` mode (static ~1h token, no refresh) is kept
+  only as a last resort and is reported as `degraded: true` by `/api/health`.
+- For a public deploy, set `COUNCIL_API_KEY` so `/api/council*` require the
+  `x-council-key` header; the rate limit, in-flight cap, and prompt cap are on
+  by default.
+- **This is a POC, not production.** Durable upgrades (SA key, workload identity
+  federation, Cloud Run keyless) are config-only but each needs an admin action —
+  see the decision matrix in [TOKEN_RELIABILITY.md](TOKEN_RELIABILITY.md).

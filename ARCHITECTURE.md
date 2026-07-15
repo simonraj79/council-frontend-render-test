@@ -22,7 +22,7 @@ flowchart TB
     end
 
     subgraph AZURE["External Cloud · Azure  (simulated by Render.com)"]
-        PROXY["ONE Node web service<br/>• serves the React build (client/dist)<br/>• Express proxy: POST /api/council/stream (SSE)<br/>• holds GOOGLE_ACCESS_TOKEN (server-side only)"]
+        PROXY["ONE Node web service<br/>• serves the React build (client/dist)<br/>• Express proxy: POST /api/council/stream (SSE)<br/>• holds GOOGLE_ADC_JSON, auto-refreshed (server-side only)"]
     end
 
     subgraph GCP["Google Cloud · Vertex AI Agent Engine"]
@@ -59,10 +59,11 @@ sequenceDiagram
     participant P as Express Proxy (Azure / Render)
     participant A as Agent Engine (Google Cloud)
 
-    B->>P: POST /api/council/stream {prompt}
-    Note over P: open SSE response (text/event-stream)
-    P->>A: POST :query {create_session}  ·  Bearer token
+    B->>P: POST /api/council/stream {prompt, userId?, sessionId?}
+    Note over P: validate + rate-limit, then open SSE response (text/event-stream)
+    P->>A: POST :query {create_session}  ·  Bearer token (auto-refreshed)
     A-->>P: { output.id }  session id
+    P-->>B: SSE event: session   ({userId, sessionId} — echo back for multi-turn)
     P->>A: POST :streamQuery?alt=sse {stream_query}
     Note over A: 5 specialists run concurrently in-process
     A-->>P: event {author: software_engineer, ...}
@@ -72,16 +73,19 @@ sequenceDiagram
     A-->>P: ux_ui_designer, security_sre, technical_writer
     P-->>B: SSE event: department   (5 cards total)
     Note over A: Chair synthesizes all five
-    A-->>P: event {output_for: council_moderator@1, ...}
+    A-->>P: event {output_for: council_moderator@N, ...}
     P-->>B: SSE event: synthesis   (readout renders)
-    P-->>B: SSE event: done
+    P-->>B: SSE event: done   ({complete: true})
 ```
 
 **Routing rule (verified against the live engine):** an event is the **synthesis**
-iff `node_info.output_for` includes `council_moderator@1` (equivalently
-`node_info.path === council_moderator@1/main_orchestration_workflow@1`). Every
-other event's `author` is one of the five specialist keys — that's how the proxy
-tags each `department` SSE event.
+iff `node_info.output_for` matches `council_moderator@N` (equivalently
+`node_info.path` matches `council_moderator@N/main_orchestration_workflow@N` —
+ADK appends an `@N` invocation counter, so the proxy matches the *names* with any
+counter rather than pinning `@1`, which broke on reruns). Every other event's
+`author` is a specialist key — that's how the proxy tags each `department` SSE
+event. Unknown authors are still relayed (with a name derived from the key), so
+a renamed or newly added specialist shows up instead of vanishing.
 
 ---
 
@@ -94,8 +98,9 @@ A React app in the browser **cannot call the Agent Engine directly** — two har
 | **Auth** | Vertex AI Agent Engine requires a **Google OAuth2 Bearer token** (no anonymous / API-key mode). | A token in client-side JS would be a credential leak. |
 | **CORS** | `*-aiplatform.googleapis.com` sends **no CORS headers** for arbitrary browser origins. | The browser blocks a direct cross-origin fetch. |
 
-The proxy solves both: it holds the token server-side and the browser calls the
-**same origin**, so CORS never applies.
+The proxy solves both: it holds the credential server-side (minting bearer
+tokens on demand) and the browser calls the **same origin**, so CORS never
+applies.
 
 ---
 
@@ -103,25 +108,37 @@ The proxy solves both: it holds the token server-side and the browser calls the
 
 ```mermaid
 flowchart LR
-    subgraph now["This demo (self-service, works today)"]
-        T1["Short-lived ADC token (~1h)<br/>set as a Render/Azure secret env var<br/>GOOGLE_ACCESS_TOKEN"]
+    subgraph now["NOW (self-service, zero admin, auto-refreshing)"]
+        T1["GOOGLE_ADC_JSON<br/>any Google credential JSON as a Render/Azure secret env var<br/>auto-refreshed via google-auth-library"]
     end
-    subgraph prod["Durable / production (needs one admin grant)"]
-        T2["Cloud Run keyless proxy<br/>runs as a service account with roles/aiplatform.user<br/>tokens auto-minted by the metadata server — no key, no expiry"]
+    subgraph legacy["Legacy (degraded)"]
+        T0["GOOGLE_ACCESS_TOKEN<br/>static ~1h token, no refresh<br/>health reports degraded: true"]
     end
-    now -.->|"upgrade path (front-end unchanged)"| prod
+    subgraph future["FUTURE (config-only, each needs an admin action)"]
+        T2["SA key (GOOGLE_SA_KEY_JSON) ·<br/>workload identity federation ·<br/>Cloud Run keyless (metadata ADC)"]
+    end
+    legacy -.->|"switch the env var"| now
+    now -.->|"upgrade path (front-end + proxy code unchanged)"| future
 ```
 
-- **Now:** a personal **short-lived (~1 h) ADC token** is injected as a secret env
-  var, purely to prove reachability. On a `401`, re-mint the token, `PUT` the env
-  var, and redeploy.
-- **Durable:** the front-end stays identical; only *where the proxy gets its token*
-  changes. The cleanest permanent design is a **Cloud Run keyless proxy** — a
-  service account with `roles/aiplatform.user`, tokens auto-minted by Cloud Run's
-  metadata server (no key file, no expiry). That needs a one-time admin grant of
-  `aiplatform.reasoningEngines.query` to the service account (this project's IAM
-  can't self-grant it). A service-account **key file** used with
-  `google-auth-library` (auto-refresh) is the alternative if org policy allows keys.
+- **Now:** **`GOOGLE_ADC_JSON`** — the full JSON of *any* Google credential file
+  (`authorized_user`, `service_account`, `external_account`, workforce,
+  impersonated SA), parsed once at startup and **auto-refreshed** by
+  `google-auth-library` before each upstream call, plus a one-shot `401` self-heal
+  retry. The only credential that is robust **today with zero admin action** is
+  the user's own OAuth2 `authorized_user` ADC JSON (it rides the existing
+  `roles/aiplatform.user`). See [TOKEN_RELIABILITY.md](TOKEN_RELIABILITY.md).
+- **Legacy:** `GOOGLE_ACCESS_TOKEN` — a static ~1 h token with no refresh; kept as
+  a last resort only, and `/api/health` reports `degraded: true`. A deployed
+  service still on it should switch its env var to `GOOGLE_ADC_JSON`.
+- **Future (config-only upgrades):** a scoped **SA key** (`GOOGLE_SA_KEY_JSON`),
+  **workload identity federation** (`external_account` JSON), or a **Cloud Run
+  keyless proxy** (metadata-server ADC, no stored secret at all). The code already
+  handles all of them through the same `GoogleAuth` path — but **each requires an
+  admin action that is currently unavailable** (SA/key creation, WIF pool setup,
+  or granting `aiplatform.reasoningEngines.query` to a runtime SA; this project's
+  IAM can't self-grant any of these). Upgrading is an env-var change, never a code
+  change.
 
 > **The deployed Agent Engine is never touched by any of this** — the proxy only
 > *calls* it. The council already streams every department; the proxy just relays
@@ -131,16 +148,24 @@ flowchart LR
 
 ## 5. SSE contract (proxy → browser)
 
+Pre-stream failures (bad prompt, missing `x-council-key`, rate limit, misconfig)
+are **plain HTTP JSON `{ error }` with real status codes** (`400`/`401`/`413`/
+`429`/`500`) — the SSE stream only opens once the request is accepted.
+
 | SSE `event:` | `data:` payload | When |
 |---|---|---|
-| `department` | `{ "key", "name", "text" }` | Each time a specialist's text arrives (accumulated). |
-| `synthesis` | `{ "text" }` | The Chair's final consolidated readout. |
-| `error` | `{ "error", "status" }` | Upstream failure (e.g. `401` token expired). |
-| `done` | `{}` | Stream complete. |
+| `session` | `{ "userId", "sessionId" }` | First — echo both back on the next request to resume the conversation (multi-turn). |
+| `department` | `{ "key", "name", "text" }` | Each time a specialist's text grows (`text` = full accumulated so far). **Unknown keys are possible** — render cards dynamically. |
+| `synthesis` | `{ "text" }` | The Chair's readout; may repeat as it grows — the last one is final. |
+| `error` | `{ "error", "status", "retryable" }` | Failure after the stream opened (e.g. mid-stream upstream error). |
+| `done` | `{ "complete": true\|false }` | Always last; `false` = the stream ended without a real synthesis. |
 
 The React app reads this with `fetch(...).body.getReader()` + `TextDecoder`
-(EventSource can't `POST`), fills the five fixed-order department cards live, then
-renders the synthesis.
+(EventSource can't `POST`), fills department cards live, then renders the
+synthesis. Abuse guards sit in front of both council routes: optional
+`COUNCIL_API_KEY` (`x-council-key` header), per-IP rate limit
+(`RATE_LIMIT_PER_MIN`, default 10/min), a global in-flight cap (`MAX_INFLIGHT`,
+default 3), and a prompt length cap (`MAX_PROMPT_CHARS`, default 4000).
 
 ---
 
@@ -152,7 +177,7 @@ side. To run the exact same thing on **Azure**:
 | This demo (Render) | Azure equivalent |
 |---|---|
 | Render free **Web Service** (Node) | **Azure App Service** (Node) or **Azure Container Apps** |
-| Render env var (secret) `GOOGLE_ACCESS_TOKEN` | App Service **Application settings** / **Azure Key Vault** reference |
+| Render env var (secret) `GOOGLE_ADC_JSON` | App Service **Application settings** / **Azure Key Vault** reference |
 | `https://<name>.onrender.com` | `https://<name>.azurewebsites.net` (or custom domain) |
 | Auto-deploy from the GitHub repo | App Service deploy via **GitHub Actions** / Oryx build |
 | (optional) split static front-end | **Azure Static Web Apps** + the proxy on App Service |
@@ -171,7 +196,7 @@ Container Apps provide identically.
 | `client/src/App.jsx` | React: prompt box, 5 progressive department cards, Chair's Synthesis; consumes the SSE stream. |
 | `client/src/styles.css` | Styling for the streaming UI. |
 | `e2e/tests/access.spec.js` | Playwright: cold-start-robust mount + streaming assertions. |
-| `.env.example` | The four env vars the proxy needs (no secrets committed). |
+| `.env.example` | The env vars the proxy needs — credential + coordinates + optional hardening (no secrets committed). |
 
 ---
 
@@ -184,5 +209,6 @@ Container Apps provide identically.
 - **Concurrency:** the five specialists run concurrently (`asyncio.gather`) on the
   agent, so department cards fill in roughly as each finishes (not strictly 1→5);
   the synthesis is always last.
-- **Not production:** see [§4](#4-auth-model) — the short-lived personal token is a
-  test affordance, not a durable credential.
+- **Not production:** see [§4](#4-auth-model) — `GOOGLE_ADC_JSON` auto-refreshes
+  but is still a broad personal credential; the durable options (SA key / WIF /
+  Cloud Run keyless) are config-only upgrades gated on an admin action.

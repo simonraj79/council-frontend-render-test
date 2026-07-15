@@ -6,7 +6,7 @@ const { test, expect } = require('@playwright/test');
 const fs = require('fs');
 const path = require('path');
 
-const RENDER_URL = process.env.RENDER_URL;
+const RENDER_URL = process.env.RENDER_URL || 'http://localhost:8080';
 
 // The 5 department author keys the UI renders as data-testid="dept-<key>".
 const DEPT_KEYS = [
@@ -18,8 +18,6 @@ const DEPT_KEYS = [
 ];
 
 test('council_moderator streams per-department + synthesis to the Render front-end', async ({ page }) => {
-  test.skip(!RENDER_URL, 'RENDER_URL env var is not set');
-
   const outDir = path.join(__dirname, '..', 'test-output');
   fs.mkdirSync(outDir, { recursive: true });
 
