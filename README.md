@@ -1,4 +1,9 @@
-# council-moderator-render — cross-cloud access to the GCP Agent Platform
+# council-moderator-render — keyless cross-cloud access to the GCP Agent Platform
+
+> **Live (2026-08-11):**
+> front end <https://council-frontend-cvic.onrender.com> ·
+> proxy <https://council-proxy-1056960165012.us-central1.run.app>
+> No Google credential and no shared secret exists on either service.
 
 A **cross-cloud access proof**: a React front-end + Node/Express proxy, deployed as
 **one Render free web service**, that reaches the `council_moderator` **Vertex AI

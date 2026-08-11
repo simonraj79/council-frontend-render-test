@@ -14,6 +14,22 @@
 # Required IAM (verified present 2026-08-11): roles/run.admin,
 # roles/iam.serviceAccountUser (actAs on the runtime SA), roles/storage.admin +
 # roles/cloudbuild.builds.editor + roles/artifactregistry.editor for the build.
+#
+# ONE-TIME PREREQUISITE, already applied to this project (2026-08-11):
+#   Cloud Build runs `--source` builds as the COMPUTE DEFAULT service account,
+#   which by default cannot read the source zip gcloud just uploaded:
+#     403 ...-compute@developer.gserviceaccount.com does not have
+#         storage.objects.get access to .../run-sources-.../....zip
+#   roles/storage.admin includes storage.buckets.setIamPolicy, so this is
+#   fixable at the BUCKET level without the project-level setIamPolicy this
+#   identity lacks:
+#     gcloud storage buckets add-iam-policy-binding gs://run-sources-<PROJECT>-<REGION> `
+#       --member=serviceAccount:<PROJECT_NUMBER>-compute@developer.gserviceaccount.com `
+#       --role=roles/storage.objectAdmin
+#     (repeat for gs://<PROJECT>_cloudbuild)
+#   Do NOT try to route around it with --build-service-account pointing at the
+#   legacy <PROJECT_NUMBER>@cloudbuild.gserviceaccount.com: Cloud Build rejects
+#   Google-managed accounts there with "provide a user-managed service account".
 
 [CmdletBinding()]
 param(
@@ -27,8 +43,10 @@ param(
   # Render workspace issuer + the subject allowed to call this proxy.
   [string]$OidcIssuer  = 'https://oidc.render.com/tea-csps46i3esus73eojjp0',
   [string]$OidcAudience = 'sts.amazonaws.com',
-  [string]$AllowedSubs = '',
-  # Bring-up fallback while the OIDC subject is still unknown. Drop it after.
+  # The live Render service. Empty = accept ANY Render service's token — only
+  # acceptable during first bring-up, before you know the subject.
+  [string]$AllowedSubs = 'workspace:tea-csps46i3esus73eojjp0:environment:default:service:srv-d9tarvad0e5s738nfj6g',
+  # Bring-up fallback only. Leave empty: the deployed service runs OIDC-only.
   [string]$RelaySecret = ''
 )
 
