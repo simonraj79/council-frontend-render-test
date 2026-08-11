@@ -34,6 +34,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# --- Quota project: the non-obvious failure this script exists to prevent ------
+#
+# This workstation's gcloud has `billing/quota_project = ve-grp-1-444-project4-3fpi`
+# and the ADC file carries the same `quota_project_id`. Billing is ENABLED on the
+# engine's project (…-333-…) and DISABLED on …-444-…, so every BILLED write —
+# the Cloud Build source upload to GCS — is charged to a project that cannot pay
+# and returns:
+#
+#   403 The billing account for the owning project is disabled in state absent
+#
+# "the owning project" reads as the bucket's project, which is billing-enabled,
+# so the message points at the wrong thing. It means the QUOTA project. Reads
+# succeed (unbilled), which is why `gcloud storage ls` looks fine.
+#
+# Scope the override to this process only — do not mutate the user's gcloud
+# config, since the 444 quota project is presumably deliberate for Vertex calls.
+$env:CLOUDSDK_BILLING_QUOTA_PROJECT = $Project
+
 if (-not $RelaySecret) {
   $bytes = New-Object byte[] 32
   [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
@@ -77,7 +95,12 @@ gcloud run deploy $Service `
   --port 8080 `
   --set-env-vars $envArg
 
-if ($LASTEXITCODE -ne 0) { throw "gcloud run deploy failed with exit code $LASTEXITCODE" }
+if ($LASTEXITCODE -ne 0) {
+  Write-Host ""
+  Write-Host "If this failed with 'The billing account for the owning project is disabled in" -ForegroundColor Yellow
+  Write-Host "state absent', see the quota-project note at the top of this script." -ForegroundColor Yellow
+  throw "gcloud run deploy failed with exit code $LASTEXITCODE"
+}
 
 $url = gcloud run services describe $Service --project $Project --region $Region --format 'value(status.url)'
 Write-Host ""
