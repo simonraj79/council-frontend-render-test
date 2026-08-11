@@ -125,20 +125,38 @@ just this one engine. Treat it accordingly:
 
 ## 6. Decision matrix
 
-**Recommendation: adopt Option 1 (`GOOGLE_ADC_JSON` holding your user refresh
-token — the health endpoint reports it as `authMode: "authorized_user"`,
-auto-refreshing) for the immediate faculty POC.** It is the only reliable option
-that fits the current IAM envelope with **zero admin action**, it permanently
-kills the ~1h outage (the library silently re-mints the token before each call),
-and it keeps the proxy + SPA exactly where they are — a config change, not a
-re-architecture.
+> **SUPERSEDED 2026-08-11 — Option 3 is now the live architecture.**
+>
+> This document previously recommended Option 1 (`GOOGLE_ADC_JSON` holding the
+> operator's personal refresh token) because Option 3 was believed to require an
+> admin grant. **That premise was wrong by the time it mattered.** A live
+> `testIamPermissions` probe on 2026-08-11 showed the IAM envelope had widened:
+> `run.services.create/update/setIamPolicy` and `iam.serviceAccounts.actAs` are
+> **granted**, and the compute default service account **already holds**
+> `roles/aiplatform.user`. No admin action was needed after all.
+>
+> Section 5 above is the reason this mattered: the recommended option put a
+> `cloud-platform`-scoped personal credential — one that can act as its owner
+> across every project they can reach — into a third-party secret store, and its
+> auto-refresh meant it never visibly failed, so nothing forced a revisit.
+>
+> **Current architecture:** Cloud Run proxy with metadata-server credentials,
+> Render relay with no Google credential, hop authenticated by Render's OIDC
+> token. See [ARCHITECTURE.md](ARCHITECTURE.md) §4 and
+> [`../adk-agent-skills/10-render-oidc-keyless.md`](../adk-agent-skills/10-render-oidc-keyless.md).
+>
+> **Action if you deployed the old model:** `gcloud auth application-default
+> revoke`, and delete `GOOGLE_ADC_JSON` from the Render service.
 
-| Option | Reliability | Needs admin? | Keeps front-end on Render/Azure? | Effort | Key risk |
-| --- | --- | --- | --- | --- | --- |
-| **1. `GOOGLE_ADC_JSON` — user refresh token, auto-refresh** *(RECOMMENDED)* | High — auto-refreshes each ~1h; valid until revoked / ~6-month inactivity / credential reset. No manual re-mint. | **No** — uses your own `roles/aiplatform.user`. | **Yes** — proxy unchanged. | **Minimal** — `gcloud auth application-default login` once, paste JSON as one secret env var, redeploy. | Broad **personal** credential in a 3rd-party secret store; dies on revoke / org reauth policy. |
-| **2. Service-account key JSON (`GOOGLE_SA_KEY_JSON`)** | High — SA key auto-refreshes, tied to a scoped SA not a person; survives faculty departure. | **Yes** — admin creates SA + key + grants `roles/aiplatform.user`. | **Yes** — proxy unchanged. | Low code (already supported), gated on admin. | Admin dependency; long-lived downloadable key is an exfiltration/secret-sprawl liability. |
-| **3. Cloud Run keyless proxy (metadata / ambient ADC)** | Highest — no stored secret; tokens minted + refreshed by the metadata server. | **Yes** — admin grants `reasoningEngines.query` to the Cloud Run runtime SA. | Front-end yes; **proxy moves to GCP** (Cloud Run). | Medium — new Cloud Run deploy + IAM grant + re-point SPA; **zero code change**. | Requires admin + new GCP infra; relocates the token-minting proxy off your hosting. |
-| **0. Raw `GOOGLE_ACCESS_TOKEN` (legacy — health reports `degraded: true`)** | Low — hard ~1h expiry, no refresh. | No | Yes | None (status quo). | Guaranteed hourly 401 outage; unusable unattended. |
+The matrix is kept for the reasoning, with verdicts corrected:
+
+| Option | Reliability | Needs admin? | Verdict |
+| --- | --- | --- | --- |
+| **3. Cloud Run keyless proxy (metadata ADC)** *(ADOPTED)* | Highest — no stored secret; tokens minted and rotated by the metadata server. | **No** — `run.admin` + `iam.serviceAccountUser` are held, and the compute SA already has `roles/aiplatform.user`. | **Chosen.** Relocates the credential-holding proxy to GCP, which is the point: on Cloud Run there is no credential to hold. |
+| **4. Render OIDC → Google STS directly (true WIF)** | Highest — same, minus a network hop. | **Yes** — one grant of `iam.workloadIdentityPoolAdmin` + one IAM binding. | **Target state.** Would delete the Cloud Run service. `server.js` already accepts `external_account` JSON, so it is a config change. |
+| **1. `GOOGLE_ADC_JSON` — user refresh token** | High — auto-refreshes; valid until revoked / ~6-month inactivity. | No | **Rejected.** Broad personal credential on a third-party host, bound to one human's account lifecycle. Its reliability was the trap: it hid the risk. |
+| **2. Service-account key JSON** | High — tied to a scoped SA, not a person. | **Yes**, and moot: `iam.serviceAccountKeys.create` is **denied**. | **Unavailable and undesirable.** Google's own guidance forbids downloadable keys. |
+| **0. Raw `GOOGLE_ACCESS_TOKEN`** | Low — hard ~1h expiry, no refresh. | No | **Rejected long ago.** Guaranteed hourly 401; unusable unattended. Retained only for the offline test suite. |
 
 ## 7. Upgrading later is CONFIG, not code
 

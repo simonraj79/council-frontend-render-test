@@ -1,0 +1,63 @@
+# render.yaml — Render Blueprint for the council FRONTEND (relay role).
+#
+# This service holds NO Google credential. It serves the SPA and forwards
+# /api/council* to the Cloud Run proxy, authenticating that hop with the OIDC
+# token Render mints for this service (short-lived, rotated automatically).
+#
+# Deploy the Cloud Run proxy FIRST (./deploy-cloudrun.ps1) — you need its URL
+# for UPSTREAM_PROXY_URL below.
+
+services:
+  - type: web
+    name: council-frontend
+    # Explicit: a Dockerfile exists in this repo for the Cloud Run proxy image,
+    # and without this Render would auto-detect it and build the API-only image
+    # with no SPA in it.
+    runtime: node
+    plan: free
+    region: singapore
+    branch: main
+    # --include=dev is load-bearing: Render sets NODE_ENV=production, which would
+    # otherwise skip vite / @vitejs/plugin-react and leave client/dist empty.
+    buildCommand: npm install && npm run build
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+
+      # --- Relay target ------------------------------------------------------
+      # The https URL of the Cloud Run proxy. Setting this is what puts the
+      # service in RELAY mode; no Google credential is read when it is set.
+      - key: UPSTREAM_PROXY_URL
+        sync: false
+
+      # --- Hop identity ------------------------------------------------------
+      # Presence of AWS_ROLE_ARN is what makes Render provision an OIDC token
+      # for this service and expose it at AWS_WEB_IDENTITY_TOKEN_FILE. We never
+      # talk to AWS; we reuse the token as a signed proof of service identity,
+      # verified by the Cloud Run proxy against Render's public JWKS.
+      - key: AWS_ROLE_ARN
+        value: arn:aws:iam::000000000000:role/unused-render-oidc-trigger
+
+      # Fallback for first boot / local dev, before the OIDC sub is pinned.
+      # Remove once the proxy verifies the OIDC assertion.
+      - key: RELAY_SECRET
+        sync: false
+
+      # --- Abuse guards ------------------------------------------------------
+      # Set a long random value to require the x-council-key header from the
+      # browser; leave unset to leave the demo open.
+      - key: COUNCIL_API_KEY
+        sync: false
+      - key: RATE_LIMIT_PER_MIN
+        value: "10"
+      - key: MAX_INFLIGHT
+        value: "3"
+      - key: MAX_PROMPT_CHARS
+        value: "4000"
+
+      # Free instances sleep after ~15 min; a cold agent adds 20-60s on top.
+      - key: UPSTREAM_TIMEOUT_MS
+        value: "200000"

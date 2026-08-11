@@ -73,19 +73,44 @@ sequenceDiagram
     A-->>P: ux_ui_designer, security_sre, technical_writer
     P-->>B: SSE event: department   (5 cards total)
     Note over A: Chair synthesizes all five
-    A-->>P: event {output_for: council_moderator@N, ...}
-    P-->>B: SSE event: synthesis   (readout renders)
+    A-->>P: event {author: council_chair, path: …/chair_decision@N/council_chair@N}
+    P-->>B: SSE event: synthesis   (readout renders progressively)
+    A-->>P: event {author: council_moderator, path: …/chair_decision@N}  (same text)
     P-->>B: SSE event: done   ({complete: true})
 ```
 
-**Routing rule (verified against the live engine):** an event is the **synthesis**
-iff `node_info.output_for` matches `council_moderator@N` (equivalently
-`node_info.path` matches `council_moderator@N/main_orchestration_workflow@N` —
+**Routing rule (verified against live session `8602554992622043136`, engine build
+2026-07-16):** an event is the **synthesis** iff any of
+
+1. `author === council_chair` — the synthesizing Agent, or
+2. `node_info.path` matches `council_moderator@N/chair_decision@N` with an
+   optional trailing `/council_chair@N`, or
+3. `node_info.output_for` matches `council_moderator@N` — legacy single-node
+   engine builds only.
+
 ADK appends an `@N` invocation counter, so the proxy matches the *names* with any
-counter rather than pinning `@1`, which broke on reruns). Every other event's
-`author` is a specialist key — that's how the proxy tags each `department` SSE
-event. Unknown authors are still relayed (with a name derived from the key), so
-a renamed or newly added specialist shows up instead of vanishing.
+counter rather than pinning `@1`, which broke on reruns.
+
+Two properties of the live stream this has to survive:
+
+- **The synthesis arrives twice** — once authored `council_chair`, once as a
+  terminal echo authored `council_moderator`. `accumulateText()` collapses the
+  duplicate rather than concatenating it.
+- **The fan-out node emits a zero-text event** authored `council_moderator`;
+  `parseCouncilLine` drops empty-text events before routing.
+
+> **History — why this is spelled out.** Before 2026-07-16 the workflow was a
+> single node named `main_orchestration_workflow` and the chair was named
+> `council_moderator`. When the engine was redeployed with two nodes and a renamed
+> chair, rules (1) and (2) did not exist and rule (3) never matched (`output_for`
+> is always a *full path*, never a bare root name). The synthesis silently stopped
+> streaming progressively — it only appeared at end-of-stream via a fallback. The
+> failure looked like latency, not breakage. `e2e/offline.test.mjs` now asserts
+> ≥2 `synthesis` frames per run specifically to catch a recurrence.
+
+Every other event's `author` is a specialist key — that's how the proxy tags each
+`department` SSE event. Unknown authors are still relayed (with a name derived
+from the key), so a renamed or newly added specialist shows up instead of vanishing.
 
 ---
 
@@ -98,47 +123,73 @@ A React app in the browser **cannot call the Agent Engine directly** — two har
 | **Auth** | Vertex AI Agent Engine requires a **Google OAuth2 Bearer token** (no anonymous / API-key mode). | A token in client-side JS would be a credential leak. |
 | **CORS** | `*-aiplatform.googleapis.com` sends **no CORS headers** for arbitrary browser origins. | The browser blocks a direct cross-origin fetch. |
 
-The proxy solves both: it holds the credential server-side (minting bearer
-tokens on demand) and the browser calls the **same origin**, so CORS never
-applies.
+A proxy solves both: it holds the credential server-side (minting bearer tokens
+on demand) and the browser calls the **same origin**, so CORS never applies.
+
+The remaining question is *where* that proxy runs — because wherever it runs is
+where the credential lives.
 
 ---
 
-## 4. Auth model
+## 4. Auth model — two hops, no stored credential
+
+`server.js` runs in one of two roles, selected by `UPSTREAM_PROXY_URL`:
 
 ```mermaid
-flowchart LR
-    subgraph now["NOW (self-service, zero admin, auto-refreshing)"]
-        T1["GOOGLE_ADC_JSON<br/>any Google credential JSON as a Render/Azure secret env var<br/>auto-refreshed via google-auth-library"]
-    end
-    subgraph legacy["Legacy (degraded)"]
-        T0["GOOGLE_ACCESS_TOKEN<br/>static ~1h token, no refresh<br/>health reports degraded: true"]
-    end
-    subgraph future["FUTURE (config-only, each needs an admin action)"]
-        T2["SA key (GOOGLE_SA_KEY_JSON) ·<br/>workload identity federation ·<br/>Cloud Run keyless (metadata ADC)"]
-    end
-    legacy -.->|"switch the env var"| now
-    now -.->|"upgrade path (front-end + proxy code unchanged)"| future
+flowchart TB
+    B["Browser<br/>(SPA)"]
+    R["<b>RELAY</b> — Render web service<br/>serves the SPA, forwards /api/council*<br/><b>reads no Google credential at all</b>"]
+    P["<b>PROXY</b> — Cloud Run<br/>calls Vertex directly<br/>runs as the compute default SA"]
+    M["GCP metadata server<br/>169.254.169.254"]
+    A["Vertex AI Agent Engine<br/>reasoningEngines/8893446530510356480"]
+    B -->|"same origin, SSE<br/>x-council-key"| R
+    R -->|"Authorization: Bearer &lt;Render OIDC JWT&gt;<br/>short-lived, auto-rotated, re-read per request"| P
+    M -->|"short-lived access token,<br/>never stored"| P
+    P -->|"Bearer token<br/>:streamQuery?alt=sse"| A
 ```
 
-- **Now:** **`GOOGLE_ADC_JSON`** — the full JSON of *any* Google credential file
-  (`authorized_user`, `service_account`, `external_account`, workforce,
-  impersonated SA), parsed once at startup and **auto-refreshed** by
-  `google-auth-library` before each upstream call, plus a one-shot `401` self-heal
-  retry. The only credential that is robust **today with zero admin action** is
-  the user's own OAuth2 `authorized_user` ADC JSON (it rides the existing
-  `roles/aiplatform.user`). See [TOKEN_RELIABILITY.md](TOKEN_RELIABILITY.md).
-- **Legacy:** `GOOGLE_ACCESS_TOKEN` — a static ~1 h token with no refresh; kept as
-  a last resort only, and `/api/health` reports `degraded: true`. A deployed
-  service still on it should switch its env var to `GOOGLE_ADC_JSON`.
-- **Future (config-only upgrades):** a scoped **SA key** (`GOOGLE_SA_KEY_JSON`),
-  **workload identity federation** (`external_account` JSON), or a **Cloud Run
-  keyless proxy** (metadata-server ADC, no stored secret at all). The code already
-  handles all of them through the same `GoogleAuth` path — but **each requires an
-  admin action that is currently unavailable** (SA/key creation, WIF pool setup,
-  or granting `aiplatform.reasoningEngines.query` to a runtime SA; this project's
-  IAM can't self-grant any of these). Upgrading is an env-var change, never a code
-  change.
+**Why this shape.** Agent Engine demands a Google OAuth token, so *some* server
+must authenticate. Putting that server on Cloud Run means it stores nothing: the
+metadata server mints short-lived tokens for the attached service account on
+demand. Render is then left holding only its own platform-issued OIDC identity,
+which it cannot leak because it never persists it.
+
+| Hop | How it authenticates | What is stored |
+|---|---|---|
+| Browser → Relay | `x-council-key` (optional) | a shared UI key, in the browser |
+| Relay → Proxy | **Render OIDC JWT**, verified against Render's public JWKS, `sub` pinned to this exact service | **nothing** |
+| Proxy → Agent Engine | GCP metadata-server token | **nothing** |
+
+The relay's `sub` is `workspace:{tea-…}:environment:{evm-…\|default}:service:{srv-…}` —
+so the allow-list distinguishes this service from every other workload Render
+hosts. **`RENDER_ALLOWED_SUBS` is not optional in production**; without it the
+proxy accepts a valid token from any Render service anywhere.
+
+This is *Secure Access to Google Gemini from Microsoft Azure Without API Keys*
+Pattern A, with the federation terminating in our own verifier instead of
+`sts.googleapis.com`, because `iam.workloadIdentityPools.create` is denied to
+this identity. Full mapping and the one-permission admin ask that removes the
+Cloud Run hop entirely: [`../adk-agent-skills/10-render-oidc-keyless.md`](../adk-agent-skills/10-render-oidc-keyless.md).
+
+### What this replaced, and why
+
+The previous model put **`GOOGLE_ADC_JSON`** — the operator's personal
+`authorized_user` refresh token — into a Render env var. It worked, and it
+auto-refreshed, which is precisely what made it easy to leave in place: it never
+visibly failed. But it is a `cloud-platform`-scoped credential that can act as
+that human across every project they can reach, sitting in a third-party secret
+store, bound to one person's account lifecycle. See
+[TOKEN_RELIABILITY.md](TOKEN_RELIABILITY.md) for the full history.
+
+`server.js` still supports every credential type through one `GoogleAuth` call
+(`authorized_user`, `service_account`, `external_account`, workforce,
+impersonated SA) — that is what makes the future WIF upgrade a config change
+rather than a rewrite. But **in relay mode no credential env var is read at
+all**, so a leftover `GOOGLE_ADC_JSON` on the Render service is ignored rather
+than silently used.
+
+`GOOGLE_ACCESS_TOKEN` (static ~1 h, no refresh) remains only as a last resort and
+for the offline test suite; `/api/health` reports `degraded: true` for it.
 
 > **The deployed Agent Engine is never touched by any of this** — the proxy only
 > *calls* it. The council already streams every department; the proxy just relays

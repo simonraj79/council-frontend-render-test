@@ -1,15 +1,34 @@
-// server.js — Express proxy for the council_moderator Agent Engine.
+// server.js — Express proxy/relay for the council_moderator Agent Engine.
 //
-// One Render Node web service does two jobs on the SAME origin (zero CORS):
-//   1. Serves the built Vite React SPA from ./client/dist (static + SPA fallback).
-//   2. Exposes the council API which server-side calls the Vertex AI Reasoning
-//      Engine REST API (create_session -> stream_query):
+// One Node service does two jobs on the SAME origin (zero CORS):
+//   1. Serves the built Vite React SPA from ./client/dist (when a build exists).
+//   2. Exposes the council API:
 //        - POST /api/council         aggregates the stream, returns { text }.
 //        - POST /api/council/stream  RELAYS the stream live as SSE so the browser
 //          can progressively reveal each department + the final synthesis.
 //
-// The browser only ever talks to its own origin, so the Google OAuth bearer
-// token never leaves the server.
+// The browser only ever talks to its own origin, so a Google OAuth bearer token
+// never reaches the client.
+//
+// ---- Two deployment roles, one file ------------------------------------------
+//
+//   PROXY (default)  — runs on CLOUD RUN. Calls Vertex directly. Its credential
+//     comes from the GCP metadata server: nothing stored, nothing to rotate,
+//     nothing to leak. This is the keyless end state.
+//   RELAY (UPSTREAM_PROXY_URL set) — runs on RENDER. Serves the SPA and forwards
+//     /api/council* to the proxy. Resolves NO Google credential at all.
+//
+// Why the split: Agent Engine requires a Google OAuth token and sends no CORS
+// headers, so *something* server-side must hold a credential. Putting that
+// something on Cloud Run means it holds no credential either — the metadata
+// server mints short-lived tokens on demand. Render is then left holding only
+// its own platform-issued OIDC identity, which it cannot leak because it does
+// not persist it.
+//
+//   RELAY ENV:  UPSTREAM_PROXY_URL, RELAY_SECRET, and (auto-set by Render)
+//               AWS_WEB_IDENTITY_TOKEN_FILE / RENDER_IDENTITY_TOKEN_FILE
+//   PROXY ENV:  RENDER_OIDC_ISSUER, RENDER_OIDC_AUDIENCE, RENDER_ALLOWED_SUBS,
+//               RELAY_SECRET (fallback gate)
 //
 // Credential env vars (parsed + validated ONCE at startup, in PRIORITY order —
 // everything except the legacy static token AUTO-REFRESHES via google-auth-library):
@@ -47,8 +66,11 @@
 import express from 'express';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import fsSync from 'node:fs';
+import fs from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { GoogleAuth } from 'google-auth-library';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -69,17 +91,70 @@ const VERTEX_BASE_URL = process.env.VERTEX_BASE_URL || `https://${HOST}`;
 const NAME = `projects/${PROJECT}/locations/${REGION}/reasoningEngines/${ENGINE_ID}`;
 const BASE = `${VERTEX_BASE_URL}/v1beta1/${NAME}`;
 
+// ---- Two roles, one codebase --------------------------------------------------
+//
+// PROXY mode  (UPSTREAM_PROXY_URL unset)  — the default, and what runs on Cloud
+//   Run. Holds the Google credential and calls Vertex directly. On Cloud Run the
+//   credential is the metadata server: nothing is stored, nothing expires.
+//
+// RELAY mode  (UPSTREAM_PROXY_URL set)    — what runs on Render. Serves the SPA
+//   and forwards /api/council* to the proxy. Resolves NO Google credential, so a
+//   Google token never exists on the Render host at all.
+//
+// The two hops authenticate to each other with the RENDER-ISSUED OIDC TOKEN — a
+// short-lived JWT that Render mints per service and rotates automatically (see
+// https://render.com/docs/oidc). This is the identity half of Workload Identity
+// Federation: the relay proves *which service it is* with a platform-signed
+// assertion instead of a stored secret. Google Cloud would normally verify that
+// assertion at sts.googleapis.com, but creating a workload identity pool needs
+// iam.workloadIdentityPools.create, which this project's identity does not hold —
+// so the proxy verifies the assertion itself, against Render's public JWKS.
+// RELAY_SECRET remains as a fallback for local dev and first-boot bring-up.
+const UPSTREAM_PROXY_URL = (process.env.UPSTREAM_PROXY_URL || '').replace(/\/+$/, '');
+const RELAY_MODE = Boolean(UPSTREAM_PROXY_URL);
+
+// Relay side: the file Render writes the OIDC token to. Render names the var
+// after whichever integration triggered provisioning, so accept all of them.
+const RENDER_TOKEN_FILE =
+  process.env.RENDER_IDENTITY_TOKEN_FILE ||
+  process.env.AWS_WEB_IDENTITY_TOKEN_FILE ||
+  process.env.ANTHROPIC_IDENTITY_TOKEN_FILE ||
+  process.env.OPENAI_IDENTITY_TOKEN_FILE ||
+  '';
+
+// Proxy side: what a caller must present. Both gates are optional; when neither
+// is set the council routes are open (unchanged local-dev behaviour).
+const RENDER_OIDC_ISSUER = (process.env.RENDER_OIDC_ISSUER || '').replace(/\/+$/, '');
+const RENDER_OIDC_AUDIENCE = (process.env.RENDER_OIDC_AUDIENCE || 'sts.amazonaws.com')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+const RENDER_ALLOWED_SUBS = (process.env.RENDER_ALLOWED_SUBS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+// Shared on BOTH hops: the relay sends it, the proxy expects it.
+const RELAY_SECRET = process.env.RELAY_SECRET || '';
+
 // ---- Synthesis routing (version-agnostic) ------------------------------------
-// The moderator's final synthesis is the event whose node_info.output_for names
-// the ROOT engine, or whose node_info.path is exactly the root workflow node.
-// ADK appends an @N invocation counter to both — @1 on the first run, higher on
-// reruns/multi-turn — so we match the NAMES and accept any counter instead of
-// pinning the literal '@1' strings (which silently broke on rename/rerun).
+// The council's final synthesis has to be told apart from the five specialists.
+// ADK appends an @N invocation counter to every node_info name — @1 on the first
+// run, higher on reruns/multi-turn — so we match the NAMES and accept any counter
+// instead of pinning the literal '@1' strings (which silently broke on rerun).
+//
+// The 2026-07-16 engine build splits the workflow into two nodes and emits the
+// synthesis TWICE, verified against live session 8602554992622043136:
+//   author=council_chair      path=council_moderator@1/chair_decision@1/council_chair@1
+//   author=council_moderator  path=council_moderator@1/chair_decision@1   (same text)
+// Both must count as the synthesis; accumulateText() collapses the duplicate.
+//
+// Note output_for is always a FULL path, so ROOT_OUTPUT_RE never fires on this
+// build — it is kept only so older single-node engine revisions still route.
 const ROOT_AGENT_NAME = process.env.ROOT_AGENT_NAME || 'council_moderator';
-const ROOT_NODE_NAME = process.env.ROOT_NODE_NAME || 'main_orchestration_workflow';
+const ROOT_NODE_NAME = process.env.ROOT_NODE_NAME || 'chair_decision';
+const CHAIR_AGENT_NAME = process.env.CHAIR_AGENT_NAME || 'council_chair';
 const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const ROOT_OUTPUT_RE = new RegExp(`^${escRe(ROOT_AGENT_NAME)}@\\d+$`);
-const ROOT_PATH_RE = new RegExp(`^${escRe(ROOT_AGENT_NAME)}@\\d+/${escRe(ROOT_NODE_NAME)}@\\d+$`);
+const ROOT_PATH_RE = new RegExp(
+  `^${escRe(ROOT_AGENT_NAME)}@\\d+/${escRe(ROOT_NODE_NAME)}@\\d+` +
+  `(?:/${escRe(CHAIR_AGENT_NAME)}@\\d+)?$`
+);
 
 // Display-name overrides for known departments. Any OTHER specialist author the
 // agent emits is still relayed, with a name derived from its key — a renamed or
@@ -128,30 +203,37 @@ let CRED_JSON = null;        // parsed credential JSON (never logged)
 let AUTH_MODE = null;        // credential type string | 'metadata-adc' | 'static-token' | null
 let AUTH_MISCONFIGURED = false;
 
-for (const envName of ['GOOGLE_ADC_JSON', 'GOOGLE_SA_KEY_JSON']) {
-  const raw = process.env[envName];
-  if (!raw || !raw.trim()) continue;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || typeof parsed.type !== 'string') {
-      throw new Error('not a credential object');
+if (RELAY_MODE) {
+  // No Google credential is read, parsed, or held in this mode — by design. If
+  // one is present in the environment it is deliberately ignored, so a leftover
+  // GOOGLE_ADC_JSON cannot silently keep a personal credential in play.
+  AUTH_MODE = 'relay';
+} else {
+  for (const envName of ['GOOGLE_ADC_JSON', 'GOOGLE_SA_KEY_JSON']) {
+    const raw = process.env[envName];
+    if (!raw || !raw.trim()) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || typeof parsed.type !== 'string') {
+        throw new Error('not a credential object');
+      }
+      CRED_JSON = parsed;
+      AUTH_MODE = parsed.type; // authorized_user | service_account | external_account | ...
+    } catch {
+      // Deliberately do NOT log the parse error (it embeds raw input) and do NOT
+      // fall through to a weaker credential — fail closed and say so in health.
+      AUTH_MISCONFIGURED = true;
+      console.error(
+        `ERROR: ${envName} is set but is not valid credential JSON (details withheld — ` +
+        're-paste the full file contents as a single line, from { to }).'
+      );
     }
-    CRED_JSON = parsed;
-    AUTH_MODE = parsed.type; // authorized_user | service_account | external_account | ...
-  } catch {
-    // Deliberately do NOT log the parse error (it embeds raw input) and do NOT
-    // fall through to a weaker credential — fail closed and say so in health.
-    AUTH_MISCONFIGURED = true;
-    console.error(
-      `ERROR: ${envName} is set but is not valid credential JSON (details withheld — ` +
-      're-paste the full file contents as a single line, from { to }).'
-    );
+    break; // first present env var wins, even when invalid
   }
-  break; // first present env var wins, even when invalid
-}
-if (!AUTH_MODE && !AUTH_MISCONFIGURED) {
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS || onGcpMetadata()) AUTH_MODE = 'metadata-adc';
-  else if (process.env.GOOGLE_ACCESS_TOKEN) AUTH_MODE = 'static-token';
+  if (!AUTH_MODE && !AUTH_MISCONFIGURED) {
+    if (process.env.GOOGLE_APPLICATION_CREDENTIALS || onGcpMetadata()) AUTH_MODE = 'metadata-adc';
+    else if (process.env.GOOGLE_ACCESS_TOKEN) AUTH_MODE = 'static-token';
+  }
 }
 const AUTH_REFRESHABLE = Boolean(AUTH_MODE) && AUTH_MODE !== 'static-token';
 
@@ -216,6 +298,16 @@ async function tokenLiveness() {
   if (_lastTokenCheck.ok !== null && now - _lastTokenCheck.at < 60000) return _lastTokenCheck.ok;
   let ok = false;
   try {
+    if (RELAY_MODE) {
+      // There is no local credential to probe — liveness IS the proxy's health.
+      const r = await fetch(`${UPSTREAM_PROXY_URL}/api/health`, {
+        signal: AbortSignal.timeout(10000),
+      });
+      const j = await r.json().catch(() => ({}));
+      ok = r.ok && Boolean(j.ok);
+      _lastTokenCheck = { at: now, ok };
+      return ok;
+    }
     const token = await getAccessToken();
     if (AUTH_MODE === 'static-token') {
       // A static token "exists" even when expired — ask tokeninfo whether it is live.
@@ -344,11 +436,13 @@ function parseCouncilLine(jsonStr) {
 
   const ni = node.node_info || ev.node_info || {};
   const outFor = Array.isArray(ni.output_for) ? ni.output_for : [];
+  const author = node.author || ev.author || '';
   const isRoot =
-    outFor.some((s) => typeof s === 'string' && ROOT_OUTPUT_RE.test(s)) ||
-    (typeof ni.path === 'string' && ROOT_PATH_RE.test(ni.path));
+    author === CHAIR_AGENT_NAME ||
+    (typeof ni.path === 'string' && ROOT_PATH_RE.test(ni.path)) ||
+    outFor.some((s) => typeof s === 'string' && ROOT_OUTPUT_RE.test(s));
   return {
-    author: node.author || ev.author || '',
+    author,
     txt,
     isRoot,
     partial: Boolean(node.partial ?? ev.partial),
@@ -478,7 +572,11 @@ function validatePrompt(message) {
   if (message.length > MAX_PROMPT_CHARS) {
     return httpErr(413, `prompt too long (max ${MAX_PROMPT_CHARS} chars)`);
   }
-  if (!PROJECT || !ENGINE_ID) {
+  // Engine coordinates live on the proxy, not the relay — the relay only needs
+  // to know where the proxy is.
+  if (RELAY_MODE) {
+    if (!UPSTREAM_PROXY_URL) return httpErr(500, 'server misconfigured: UPSTREAM_PROXY_URL not set');
+  } else if (!PROJECT || !ENGINE_ID) {
     return httpErr(500, 'server misconfigured: GCP_PROJECT / ENGINE_ID not set');
   }
   return null;
@@ -512,6 +610,93 @@ function requireCouncilKey(req, res, next) {
   next();
 }
 
+// ---- Relay hop identity (Render -> Cloud Run) ---------------------------------
+
+// RELAY SIDE. Read the OIDC token from disk on EVERY request: Render rotates the
+// file in place, so caching the string would pin an expiring token.
+async function relayIdentityHeaders() {
+  const h = {};
+  if (RENDER_TOKEN_FILE) {
+    try {
+      const jwt = (await fs.readFile(RENDER_TOKEN_FILE, 'utf8')).trim();
+      if (jwt) h.Authorization = `Bearer ${jwt}`;
+    } catch (e) {
+      // Never fatal: the shared secret below still authenticates the hop.
+      console.error('relay: could not read the Render identity token file:', e.code || e.message);
+    }
+  }
+  if (RELAY_SECRET) h['x-relay-secret'] = RELAY_SECRET;
+  return h;
+}
+
+// PROXY SIDE. Resolve Render's JWKS via OIDC discovery rather than guessing the
+// path, and cache the resolved key set (jose refreshes keys on rotation itself).
+let _jwksPromise = null;
+function renderJwks() {
+  if (!_jwksPromise) {
+    _jwksPromise = (async () => {
+      const url = `${RENDER_OIDC_ISSUER}/.well-known/openid-configuration`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`OIDC discovery ${r.status} at ${url}`);
+      const cfg = await r.json();
+      if (!cfg.jwks_uri) throw new Error('OIDC discovery document has no jwks_uri');
+      return createRemoteJWKSet(new URL(cfg.jwks_uri));
+    })().catch((e) => {
+      _jwksPromise = null; // let the next request retry a transient discovery failure
+      throw e;
+    });
+  }
+  return _jwksPromise;
+}
+
+// Last identity that verified, surfaced in /api/health for authorized callers.
+// This is how you discover the exact `sub` to pin in RENDER_ALLOWED_SUBS without
+// having to guess the workspace/environment/service triple.
+let LAST_VERIFIED_SUB = null;
+
+// Gate the council routes on the caller's identity. Open when neither mechanism
+// is configured (local dev). Never applied in relay mode — there the caller is a
+// browser, which authenticates with COUNCIL_API_KEY instead.
+async function requireRelayIdentity(req, res, next) {
+  if (RELAY_MODE) return next();
+  if (!RENDER_OIDC_ISSUER && !RELAY_SECRET) return next();
+
+  const authz = req.get('authorization') || '';
+  if (RENDER_OIDC_ISSUER && authz.startsWith('Bearer ')) {
+    try {
+      const { payload } = await jwtVerify(authz.slice(7).trim(), await renderJwks(), {
+        issuer: RENDER_OIDC_ISSUER,
+        audience: RENDER_OIDC_AUDIENCE,
+      });
+      // An allow-list of subjects is what makes this an identity check rather
+      // than "any Render service on the internet". Without it we would trust
+      // every workload Render hosts.
+      if (RENDER_ALLOWED_SUBS.length && !RENDER_ALLOWED_SUBS.includes(payload.sub)) {
+        console.warn('relay-auth: rejected non-allow-listed sub:', payload.sub);
+        return res.status(403).json({ error: 'forbidden: caller identity is not allow-listed' });
+      }
+      LAST_VERIFIED_SUB = payload.sub || null;
+      return next();
+    } catch (e) {
+      // Log the reason (never the token) and fall through to the secret path.
+      console.warn('relay-auth: OIDC verification failed:', e.code || e.message);
+    }
+  }
+
+  if (RELAY_SECRET && timingSafeEq(req.get('x-relay-secret') || '', RELAY_SECRET)) return next();
+  return res.status(401).json({ error: 'unauthorized: caller identity could not be verified' });
+}
+
+// ---- Relay forwarding ---------------------------------------------------------
+async function relayPost(pathname, body, signal) {
+  return fetch(`${UPSTREAM_PROXY_URL}${pathname}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(await relayIdentityHeaders()) },
+    body: JSON.stringify(body || {}),
+    signal,
+  });
+}
+
 const rateWindows = new Map(); // ip -> { start, count }
 function rateLimit(req, res, next) {
   if (RATE_LIMIT_PER_MIN <= 0) return next();
@@ -540,7 +725,9 @@ app.set('trust proxy', 1); // Render terminates TLS in front of us; trust one ho
 app.use(express.json({ limit: '16kb' })); // the API only ever carries a prompt string
 
 app.get('/api/health', async (req, res) => {
-  const configured = Boolean(PROJECT && ENGINE_ID && AUTH_MODE && !AUTH_MISCONFIGURED);
+  const configured = RELAY_MODE
+    ? Boolean(UPSTREAM_PROXY_URL)
+    : Boolean(PROJECT && ENGINE_ID && AUTH_MODE && !AUTH_MISCONFIGURED);
   const body = {
     ok: configured,
     configured,
@@ -558,15 +745,30 @@ app.get('/api/health', async (req, res) => {
   // presents the key.
   const authorized = !COUNCIL_API_KEY || timingSafeEq(req.get('x-council-key') || '', COUNCIL_API_KEY);
   if (authorized) {
-    body.authMode = AUTH_MODE; // credential type | metadata-adc | static-token | null
+    body.authMode = AUTH_MODE; // credential type | metadata-adc | relay | static-token | null
     body.project = PROJECT || null;
     body.region = REGION;
     body.engineId = ENGINE_ID || null;
+    if (RELAY_MODE) {
+      body.upstreamProxy = UPSTREAM_PROXY_URL;
+      // Which identity mechanism this relay can actually present upstream. If
+      // this says "secret" on Render, the OIDC token file was not provisioned.
+      body.relayIdentity = RENDER_TOKEN_FILE
+        ? (fsSync.existsSync(RENDER_TOKEN_FILE) ? 'render-oidc' : 'render-oidc-file-missing')
+        : (RELAY_SECRET ? 'secret' : 'none');
+      body.relayTokenFile = RENDER_TOKEN_FILE || null; // a path, not a secret
+    } else {
+      // Bring-up aid: the exact `sub` of the last caller that verified, so it can
+      // be pinned into RENDER_ALLOWED_SUBS without guessing the ID triple.
+      body.callerGate = RENDER_OIDC_ISSUER ? 'render-oidc' : (RELAY_SECRET ? 'secret' : 'open');
+      body.lastVerifiedSub = LAST_VERIFIED_SUB;
+      body.allowedSubs = RENDER_ALLOWED_SUBS.length ? RENDER_ALLOWED_SUBS : null;
+    }
   }
   res.json(body);
 });
 
-app.post('/api/council', requireCouncilKey, rateLimit, async (req, res) => {
+app.post('/api/council', requireCouncilKey, requireRelayIdentity, rateLimit, async (req, res) => {
   const { message, userId, sessionId: givenSession } = extractCouncilInput(req.body);
   const invalid = validatePrompt(message);
   if (invalid) {
@@ -581,6 +783,19 @@ app.post('/api/council', requireCouncilKey, rateLimit, async (req, res) => {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS);
   try {
+    if (RELAY_MODE) {
+      let up;
+      try {
+        up = await relayPost('/api/council', req.body, ctrl.signal);
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        console.error('relay: upstream request failed:', e.message || e);
+        throw httpErr(502, 'relay could not reach the council proxy');
+      }
+      // The proxy already speaks this exact contract, so pass its answer through
+      // verbatim rather than re-serialising and risking contract drift.
+      return res.status(up.status).type('application/json').send(await up.text());
+    }
     // Session is best-effort; if it fails, proceed with just {user_id, message}.
     let sid = givenSession;
     if (!sid) {
@@ -618,7 +833,14 @@ app.post('/api/council', requireCouncilKey, rateLimit, async (req, res) => {
 //   event: synthesis   data: {"text"}                            (moderator synthesis)
 //   event: error       data: {"error","status","retryable"?}
 //   event: done        data: {"complete": true|false}            (false = no synthesis seen)
-app.post('/api/council/stream', requireCouncilKey, rateLimit, async (req, res) => {
+const SSE_HEADERS = {
+  'Content-Type': 'text/event-stream',
+  'Cache-Control': 'no-cache',
+  Connection: 'keep-alive',
+  'X-Accel-Buffering': 'no',
+};
+
+app.post('/api/council/stream', requireCouncilKey, requireRelayIdentity, rateLimit, async (req, res) => {
   const { message, userId, sessionId: givenSession } = extractCouncilInput(req.body);
 
   // Reject invalid/over-capacity requests as PLAIN HTTP before opening the SSE
@@ -633,13 +855,65 @@ app.post('/api/council/stream', requireCouncilKey, rateLimit, async (req, res) =
   }
   inFlight++;
 
+  // ---- RELAY MODE: forward the proxy's SSE stream byte-for-byte -------------
+  // Await the upstream response BEFORE writing any headers. That is what keeps
+  // the "pre-stream failures are plain HTTP JSON" half of the contract intact:
+  // a 401/429/500 from the proxy reaches the browser as that status, not as an
+  // SSE error frame inside a 200.
+  if (RELAY_MODE) {
+    const rCtrl = new AbortController();
+    const rTimer = setTimeout(() => rCtrl.abort(), UPSTREAM_TIMEOUT_MS);
+    res.on('close', () => { rCtrl.abort(); clearTimeout(rTimer); });
+    try {
+      const up = await relayPost('/api/council/stream', req.body, rCtrl.signal);
+      if (!up.ok || !up.body) {
+        const body = await up.text().catch(() => '');
+        return res
+          .status(up.status || 502)
+          .type('application/json')
+          .send(body || JSON.stringify({ error: 'council proxy returned an empty response' }));
+      }
+      res.writeHead(200, SSE_HEADERS);
+      if (typeof res.flushHeaders === 'function') res.flushHeaders();
+      const reader = up.body.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!res.write(Buffer.from(value))) {
+          // Respect backpressure so a slow browser cannot balloon the heap.
+          await new Promise((resolve) => res.once('drain', resolve));
+        }
+      }
+      return res.end();
+    } catch (e) {
+      if (res.headersSent) {
+        // Mid-stream failure: the browser already has partial cards. Emit a real
+        // error frame so the client stops waiting instead of hanging to timeout.
+        const retryable = e.name === 'AbortError';
+        try {
+          res.write('event: error\ndata: ' + JSON.stringify({
+            error: retryable ? 'relay timed out waiting for the council proxy' : 'relay lost the council proxy stream',
+            status: retryable ? 504 : 502,
+            retryable: true,
+          }) + '\n\n');
+          res.write('event: done\ndata: ' + JSON.stringify({ complete: false }) + '\n\n');
+        } catch {}
+        try { res.end(); } catch {}
+        return;
+      }
+      if (e.name === 'AbortError') {
+        return res.status(504).json({ error: `council proxy timed out after ${UPSTREAM_TIMEOUT_MS}ms (cold start)` });
+      }
+      console.error('relay: stream request failed:', e.message || e);
+      return res.status(502).json({ error: 'relay could not reach the council proxy' });
+    } finally {
+      inFlight--;
+      clearTimeout(rTimer);
+    }
+  }
+
   // SSE headers — flush immediately so the browser opens the stream.
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  });
+  res.writeHead(200, SSE_HEADERS);
   if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
   const sse = (event, obj) => {
@@ -751,16 +1025,62 @@ app.post('/api/council/stream', requireCouncilKey, rateLimit, async (req, res) =
 });
 
 // ---- Static SPA (registered AFTER the API routes) ---------------------------
+// Only mount when a build actually exists. The Cloud Run proxy image is API-only,
+// and without this guard the catch-all's sendFile would throw ENOENT and turn
+// EVERY non-API route into a 500 — which is also exactly what a misconfigured
+// Render build command used to produce.
 const DIST = path.join(__dirname, 'client', 'dist');
-app.use(express.static(DIST));
-// Catch-all for client-side routing; never intercepts /api/* (handled above).
-app.get('*', (_req, res) => {
-  res.sendFile(path.join(DIST, 'index.html'));
-});
+const HAS_SPA = fsSync.existsSync(path.join(DIST, 'index.html'));
+if (HAS_SPA) {
+  app.use(express.static(DIST));
+  // Catch-all for client-side routing; never intercepts /api/* (handled above).
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(DIST, 'index.html'));
+  });
+} else {
+  app.get('*', (_req, res) => {
+    res.status(404).json({ error: 'not found — this deployment serves the council API only' });
+  });
+}
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`council-moderator proxy listening on 0.0.0.0:${PORT}`);
+  console.log(
+    `council ${RELAY_MODE ? 'RELAY' : 'PROXY'} listening on 0.0.0.0:${PORT}` +
+    ` (SPA: ${HAS_SPA ? 'served' : 'absent — API only'})`
+  );
+  if (RELAY_MODE) {
+    console.log(`relay -> ${UPSTREAM_PROXY_URL}  (no Google credential is held by this process)`);
+    if (RENDER_TOKEN_FILE) {
+      const present = fsSync.existsSync(RENDER_TOKEN_FILE);
+      console.log(
+        `relay identity: Render OIDC token file ${RENDER_TOKEN_FILE} — ${present ? 'present' : 'MISSING'}` +
+        (present ? '' : ' (falling back to RELAY_SECRET; check the OIDC env var on the service)')
+      );
+    } else {
+      console.warn(
+        'WARN: no Render OIDC token file found — the hop will authenticate with RELAY_SECRET only. ' +
+        'Set AWS_ROLE_ARN on the Render service to have Render provision an OIDC token.'
+      );
+    }
+    if (!RELAY_SECRET && !RENDER_TOKEN_FILE) {
+      console.error('ERROR: neither a Render OIDC token nor RELAY_SECRET is available — upstream calls will be rejected');
+    }
+    if (!COUNCIL_API_KEY) console.log('note: COUNCIL_API_KEY unset — /api/council is open (set it to require x-council-key)');
+    return;
+  }
+  if (RENDER_OIDC_ISSUER) {
+    console.log(
+      `caller gate: Render OIDC, issuer ${RENDER_OIDC_ISSUER}, audience ${RENDER_OIDC_AUDIENCE.join(',')}, ` +
+      (RENDER_ALLOWED_SUBS.length
+        ? `${RENDER_ALLOWED_SUBS.length} allow-listed subject(s)`
+        : 'NO subject allow-list — set RENDER_ALLOWED_SUBS to pin your service')
+    );
+  } else if (RELAY_SECRET) {
+    console.log('caller gate: shared RELAY_SECRET (set RENDER_OIDC_ISSUER to upgrade to keyless OIDC)');
+  } else {
+    console.warn('WARN: no caller gate — /api/council accepts any request. Set RENDER_OIDC_ISSUER or RELAY_SECRET.');
+  }
   if (AUTH_MISCONFIGURED) {
     console.error('ERROR: credential env var present but unparseable — all council calls will fail until it is re-set');
   } else if (!AUTH_MODE) {

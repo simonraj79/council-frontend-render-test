@@ -61,24 +61,53 @@ frontend_test_render/
   e2e/              Playwright test (cold-start-robust mount + streaming assertions)
 ```
 
+## Two roles, one file
+
+`server.js` runs as either half of the deployment. `UPSTREAM_PROXY_URL` decides which:
+
+| Role | Where | Credential it holds |
+| --- | --- | --- |
+| **RELAY** (`UPSTREAM_PROXY_URL` set) | Render | **None.** Serves the SPA, forwards `/api/council*`, proves its identity with Render's OIDC token. |
+| **PROXY** (unset — the default) | Cloud Run | **None stored.** Tokens come from the GCP metadata server. |
+
+Full rationale: [ARCHITECTURE.md](ARCHITECTURE.md) §4 and
+[`../adk-agent-skills/10-render-oidc-keyless.md`](../adk-agent-skills/10-render-oidc-keyless.md).
+
 ## Environment variables (server-side)
 
-**Credential (set exactly ONE — resolved in this priority order at startup):**
+**Relay (Render):**
 
 | Var | Purpose |
 | --- | --- |
-| `GOOGLE_ADC_JSON` | **Recommended.** Full JSON of *any* Google credential file (`authorized_user`, `service_account`, `external_account`, …) — auto-refreshed via `google-auth-library`, so it survives past 1 hour with zero re-minting. |
-| `GOOGLE_SA_KEY_JSON` | Service-account key JSON — same auto-refresh handling; kept separate so an admin-issued SA key can coexist untouched. |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Path to a key file, or run on GCP metadata (Cloud Run/GCE) for keyless ambient ADC. |
-| `GOOGLE_ACCESS_TOKEN` | **Legacy.** Static ~1h token, no refresh — last resort; `/api/health` reports `degraded: true` in this mode. |
+| `UPSTREAM_PROXY_URL` | The Cloud Run proxy's https URL. Setting it switches on relay mode; **no Google credential is read in this mode**, even if one is present. |
+| `AWS_ROLE_ARN` | Any placeholder. Its presence is what makes Render provision an OIDC token and set `AWS_WEB_IDENTITY_TOKEN_FILE`. We never call AWS. |
+| `RELAY_SECRET` | Bring-up fallback shared with the proxy. Remove once OIDC verification is confirmed. |
+
+**Proxy (Cloud Run):**
+
+| Var | Purpose |
+| --- | --- |
+| `RENDER_OIDC_ISSUER` | `https://oidc.render.com/<tea-…>` — your Render workspace id. |
+| `RENDER_OIDC_AUDIENCE` | Expected `aud` claim; `sts.amazonaws.com` for Render's AWS integration. Comma-separated list accepted. |
+| `RENDER_ALLOWED_SUBS` | **Set this.** The exact `workspace:…:environment:…:service:…` allowed to call. Without it, any Render service in the world with a valid token is accepted. Read the value off `/api/health` as `lastVerifiedSub`. |
+
+**Credential (PROXY mode only — and on Cloud Run you set NONE of these):**
+
+| Var | Purpose |
+| --- | --- |
+| *(nothing)* | On Cloud Run, ambient ADC via the metadata server. This is the intended configuration. |
+| `GOOGLE_ADC_JSON` | Full JSON of *any* Google credential file (`authorized_user`, `service_account`, `external_account`, …), auto-refreshed. **An `authorized_user` value here is a broad personal credential — see the security note.** This is also the slot the future WIF `external_account` config goes into. |
+| `GOOGLE_SA_KEY_JSON` | Service-account key JSON. Not obtainable under this project's IAM, and discouraged. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to a key file, or run on GCP metadata for keyless ambient ADC. |
+| `GOOGLE_ACCESS_TOKEN` | **Legacy.** Static ~1h token, no refresh; `/api/health` reports `degraded: true`. Used by the offline test suite. |
 
 **Engine coordinates + hardening:**
 
 | Var | Purpose |
 | --- | --- |
-| `GCP_PROJECT` | `ve-grp-1-333-project3-9rqd` (also accepts `PROJECT`). |
-| `GCP_REGION` | `us-central1` (also accepts `REGION`). |
-| `ENGINE_ID` | `8893446530510356480`. |
+| `GCP_PROJECT` | `ve-grp-1-333-project3-9rqd` (also accepts `PROJECT`). Proxy only. |
+| `GCP_REGION` | `us-central1` (also accepts `REGION`). Proxy only. |
+| `ENGINE_ID` | `8893446530510356480`. Proxy only. |
 | `COUNCIL_API_KEY` | Optional. If set, `/api/council*` require the `x-council-key` header (and `/api/health` hides coordinates from callers without it). |
 | `RATE_LIMIT_PER_MIN` | Optional. Per-IP requests/min on council routes (default `10`, `0` = off). |
 | `MAX_INFLIGHT` | Optional. Global concurrent council runs (default `3`; excess gets `429`). |
@@ -145,18 +174,52 @@ cd e2e && npm install && npx playwright install chromium
 RENDER_URL="https://<name>.onrender.com" npx playwright test
 ```
 
-## Deploy on Render (free web service)
+## Deploy
 
-- **Runtime:** Node
-- **Plan:** free
-- **Build command:** `npm install && npm run build`
-- **Start command:** `npm start`
-- **Env vars:** `GOOGLE_ADC_JSON` (secret, recommended — see
-  [TOKEN_RELIABILITY.md](TOKEN_RELIABILITY.md)), `GCP_PROJECT`, `GCP_REGION`,
-  `ENGINE_ID`; optionally `COUNCIL_API_KEY` (secret) and the other hardening vars above.
-  An existing deploy still on `GOOGLE_ACCESS_TOKEN` should switch its env var to
-  `GOOGLE_ADC_JSON` — no code change.
+Two steps, in this order — the relay needs the proxy's URL.
+
+### 1. The Cloud Run proxy (keyless)
+
+```powershell
+./deploy-cloudrun.ps1
+```
+
+Deploys as `1056960165012-compute@developer.gserviceaccount.com`, which already
+holds `roles/aiplatform.user`. Note what the resulting service does **not** have:
+any credential env var at all. Verify:
+
+```bash
+curl https://council-proxy-….run.app/api/health
+# {"authMode":"metadata-adc","callerGate":"render-oidc",...}
+```
+
+It is deployed `--allow-unauthenticated` because Render has no Google identity
+to present. Access control is the OIDC `sub` allow-list, not Cloud Run IAM.
+
+### 2. The Render web service (relay)
+
+`render.yaml` is a Blueprint; or configure by hand:
+
+- **Runtime:** Node — set it **explicitly**. A `Dockerfile` exists in this repo for
+  the Cloud Run image, and Render would otherwise auto-detect it and build the
+  API-only image with no SPA in it.
+- **Plan:** free · **Build:** `npm install && npm run build` · **Start:** `npm start`
+- **Env vars:** `UPSTREAM_PROXY_URL`, `AWS_ROLE_ARN` (placeholder, triggers OIDC),
+  `RELAY_SECRET`, optionally `COUNCIL_API_KEY` and the hardening vars.
+  **Nothing Google-related.**
 - The server binds `0.0.0.0:$PORT` (Render injects `PORT`).
+
+### 3. Pin the identity — don't skip
+
+```bash
+curl https://<render-url>/api/council -d '{"prompt":"hello"}' -H 'content-type: application/json'
+curl https://council-proxy-….run.app/api/health    # read lastVerifiedSub
+gcloud run services update council-proxy --region us-central1 \
+  --update-env-vars "^;;^RENDER_ALLOWED_SUBS=<that value>"
+```
+
+Then delete `RELAY_SECRET` from both services. At that point the system holds no
+shared secret and no Google credential anywhere.
 
 ### Cold starts & timeouts
 
@@ -169,18 +232,25 @@ enabling **Always On** (paid tier) removes cold starts entirely.
 
 ## Security note (read this)
 
-The proxy holds a **real Google credential on a third-party host**, so treat the
-env var as a secret (secret-typed env var / Key Vault reference; never log it).
+**No Google credential is stored anywhere in this deployment.** That is the
+design, and it is worth keeping:
 
-- **Credential setup, reliability, and rotation are covered in
-  [TOKEN_RELIABILITY.md](TOKEN_RELIABILITY.md)** — including why `GOOGLE_ADC_JSON`
-  auto-refreshes past the old ~1h outage, what a persistent `401` means now
-  (revoked credential or lost IAM role, not expiry), and how to revoke.
-- The legacy `GOOGLE_ACCESS_TOKEN` mode (static ~1h token, no refresh) is kept
-  only as a last resort and is reported as `degraded: true` by `/api/health`.
+- **The Render service must never get `GOOGLE_ADC_JSON`.** Relay mode ignores it,
+  but don't set it. An `authorized_user` value is a `cloud-platform`-scoped
+  personal credential that can act as its owner across every project they can
+  reach — the previous model, and the reason for this rewrite. History:
+  [TOKEN_RELIABILITY.md](TOKEN_RELIABILITY.md).
+- **`RENDER_ALLOWED_SUBS` is the access control.** The Cloud Run service is
+  public; a valid Render OIDC token is what gets you in. Until the `sub` is
+  pinned, *any* Render service with a token for the configured audience is
+  accepted. Pin it.
+- **Rotate what the old model exposed.** If you ran the `GOOGLE_ADC_JSON`
+  deployment: `gcloud auth application-default revoke`.
 - For a public deploy, set `COUNCIL_API_KEY` so `/api/council*` require the
   `x-council-key` header; the rate limit, in-flight cap, and prompt cap are on
-  by default.
-- **This is a POC, not production.** Durable upgrades (SA key, workload identity
-  federation, Cloud Run keyless) are config-only but each needs an admin action —
-  see the decision matrix in [TOKEN_RELIABILITY.md](TOKEN_RELIABILITY.md).
+  by default. Note the rate limiter is **per instance and in memory** — it is a
+  speed bump, not a quota.
+- **Still a POC in one respect:** the relay→proxy hop terminates federation in
+  our own verifier rather than at Google STS, because
+  `iam.workloadIdentityPools.create` is denied here. One admin grant closes that
+  gap — [`../adk-agent-skills/10-render-oidc-keyless.md`](../adk-agent-skills/10-render-oidc-keyless.md) §6.

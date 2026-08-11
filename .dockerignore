@@ -1,0 +1,14 @@
+# The Cloud Run image is API-only: keep the SPA, tests and local secrets out of
+# the build context entirely. Smaller context = faster builds and no chance of
+# shipping a .env into an image.
+node_modules
+client
+e2e
+.git
+.env
+.env.local
+*.log
+*.md
+render.yaml
+deploy-cloudrun.ps1
+.playwright-mcp

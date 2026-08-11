@@ -1,8 +1,8 @@
 {
   "name": "council-moderator-render",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Cross-platform access proof: Render-hosted React + Express proxy reaching a Vertex AI Agent Engine (council_moderator).",
+  "description": "Keyless access to a Vertex AI Agent Engine (council_moderator): Render-hosted React SPA + relay, forwarding to a Cloud Run proxy that authenticates via the GCP metadata server.",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -10,10 +10,13 @@
   "scripts": {
     "build": "npm --prefix client install --include=dev && npm --prefix client run build",
     "start": "node server.js",
-    "dev": "node --env-file=.env server.js"
+    "dev": "node --env-file=.env server.js",
+    "test": "node --test e2e/offline.test.mjs",
+    "test:offline": "node --test e2e/offline.test.mjs"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "google-auth-library": "^10"
+    "google-auth-library": "^10",
+    "jose": "^5.9.6"
   }
 }
